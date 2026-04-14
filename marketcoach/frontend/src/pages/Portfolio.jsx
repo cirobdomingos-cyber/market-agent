@@ -16,6 +16,12 @@ export default function Portfolio() {
   // Which position (if any) is currently open in the SellModal.
   // null = modal closed; a position object = modal open for that row.
   const [sellingPosition, setSellingPosition] = useState(null)
+  const [alerts, setAlerts] = useState([])
+  const [newAlertTicker, setNewAlertTicker] = useState('')
+  const [newAlertCondition, setNewAlertCondition] = useState('above')
+  const [newAlertPrice, setNewAlertPrice] = useState('')
+  const [newAlertNote, setNewAlertNote] = useState('')
+  const [alertError, setAlertError] = useState(null)
 
   const fetchWatchlist = async () => {
     try {
@@ -58,21 +64,70 @@ export default function Portfolio() {
     }
   }
 
+  const fetchAlerts = async () => {
+    try {
+      const res = await axios.get(`${API}/alerts`)
+      setAlerts(res.data || [])
+    } catch (err) {
+      console.error('Failed to fetch alerts:', err)
+    }
+  }
+
+  const addAlert = async () => {
+    const t = newAlertTicker.trim().toUpperCase()
+    const price = parseFloat(newAlertPrice)
+    if (!t || !price || price <= 0) {
+      setAlertError('Ticker and target price required')
+      return
+    }
+    setAlertError(null)
+    try {
+      await axios.post(`${API}/alerts`, {
+        ticker: t,
+        condition: newAlertCondition,
+        target_price: price,
+        note: newAlertNote.trim() || null,
+      })
+      setNewAlertTicker('')
+      setNewAlertPrice('')
+      setNewAlertNote('')
+      fetchAlerts()
+    } catch (err) {
+      const detail = err.response?.data?.detail
+      setAlertError(
+        Array.isArray(detail)
+          ? detail.map((d) => d.msg || JSON.stringify(d)).join('; ')
+          : detail || 'Failed to create alert'
+      )
+    }
+  }
+
+  const removeAlert = async (alertId) => {
+    try {
+      await axios.delete(`${API}/alerts/${alertId}`)
+      fetchAlerts()
+    } catch (err) {
+      console.error('Failed to delete alert:', err)
+    }
+  }
+
   useEffect(() => {
     let cancelled = false
     async function fetchData() {
       try {
-        const [portRes, ordRes, accRes, wlRes] = await Promise.all([
+        const [portRes, ordRes, accRes, wlRes, alRes] = await Promise.all([
           axios.get(`${API}/portfolio`).catch(() => ({ data: null })),
           axios.get(`${API}/portfolio/orders`).catch(() => ({ data: [] })),
           axios.get(`${API}/accuracy`),
           axios.get(`${API}/watchlist`).catch(() => ({ data: [] })),
+          axios.get(`${API}/alerts`).catch(() => ({ data: [] })),
         ])
         if (cancelled) return
         setPortfolio(portRes.data)
         setOrders(ordRes.data || [])
         setAccuracy(accRes.data)
         setWatchlist(wlRes.data || [])
+        setAlerts(alRes.data || [])
       } catch (err) {
         console.error('Failed to load portfolio:', err)
       } finally {
@@ -272,6 +327,118 @@ export default function Portfolio() {
                       <button
                         onClick={() => removeTicker(w.ticker)}
                         title={`Remove ${w.ticker}`}
+                        className="text-xs text-gray-500 hover:text-red-400 transition-colors"
+                      >
+                        ✕
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Price Alerts */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
+            Alerts ({alerts.filter((a) => a.active).length})
+          </h2>
+          <p className="text-xs text-gray-500">
+            Fires a notification when price crosses your level. Checked every 5 minutes.
+          </p>
+        </div>
+
+        {/* Add-alert row */}
+        <div className="border border-gray-800 rounded-lg p-3 mb-3 flex gap-2 items-start flex-wrap">
+          <input
+            type="text"
+            value={newAlertTicker}
+            onChange={(e) => setNewAlertTicker(e.target.value.toUpperCase())}
+            onKeyDown={(e) => e.key === 'Enter' && addAlert()}
+            placeholder="TICKER"
+            maxLength={5}
+            className="w-24 bg-gray-950 border border-gray-700 rounded px-2 py-1.5 text-sm font-mono focus:outline-none focus:border-indigo-500"
+          />
+          <select
+            value={newAlertCondition}
+            onChange={(e) => setNewAlertCondition(e.target.value)}
+            className="bg-gray-950 border border-gray-700 rounded px-2 py-1.5 text-sm focus:outline-none focus:border-indigo-500"
+          >
+            <option value="above">above</option>
+            <option value="below">below</option>
+          </select>
+          <input
+            type="number"
+            step="0.01"
+            min="0"
+            value={newAlertPrice}
+            onChange={(e) => setNewAlertPrice(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && addAlert()}
+            placeholder="Target $"
+            className="w-28 bg-gray-950 border border-gray-700 rounded px-2 py-1.5 text-sm focus:outline-none focus:border-indigo-500"
+          />
+          <input
+            type="text"
+            value={newAlertNote}
+            onChange={(e) => setNewAlertNote(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && addAlert()}
+            placeholder="Optional note — e.g. 'resistance, trim 25%'"
+            maxLength={500}
+            className="flex-1 min-w-[180px] bg-gray-950 border border-gray-700 rounded px-2 py-1.5 text-sm focus:outline-none focus:border-indigo-500"
+          />
+          <button
+            onClick={addAlert}
+            disabled={!newAlertTicker.trim() || !newAlertPrice}
+            className="px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-800 disabled:text-gray-500 rounded font-medium transition-colors"
+          >
+            Add
+          </button>
+        </div>
+        {alertError && (
+          <p className="text-xs text-red-300 mb-2">{alertError}</p>
+        )}
+
+        {alerts.length === 0 ? (
+          <p className="text-gray-500 text-sm">No alerts set.</p>
+        ) : (
+          <div className="border border-gray-800 rounded-lg overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-900 text-gray-400">
+                <tr>
+                  <th className="text-left px-4 py-2 w-24">Ticker</th>
+                  <th className="text-left px-4 py-2 w-24">Condition</th>
+                  <th className="text-right px-4 py-2 w-28">Target</th>
+                  <th className="text-left px-4 py-2">Note</th>
+                  <th className="text-left px-4 py-2 w-32">Status</th>
+                  <th className="text-right px-4 py-2 w-16"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {alerts.map((a) => (
+                  <tr key={a.id} className="border-t border-gray-800">
+                    <td className="px-4 py-2 font-mono font-bold text-white">{a.ticker}</td>
+                    <td className="px-4 py-2 text-gray-300">{a.condition}</td>
+                    <td className="px-4 py-2 text-right font-mono">${Number(a.target_price).toFixed(2)}</td>
+                    <td className="px-4 py-2 text-gray-400">
+                      {a.note || <span className="text-gray-700 italic">—</span>}
+                    </td>
+                    <td className="px-4 py-2 text-xs">
+                      {a.active ? (
+                        <span className="text-green-400">● watching</span>
+                      ) : (
+                        <span className="text-gray-500">
+                          triggered
+                          {a.triggered_price ? ` @ $${Number(a.triggered_price).toFixed(2)}` : ''}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2 text-right">
+                      <button
+                        onClick={() => removeAlert(a.id)}
+                        title="Delete alert"
                         className="text-xs text-gray-500 hover:text-red-400 transition-colors"
                       >
                         ✕

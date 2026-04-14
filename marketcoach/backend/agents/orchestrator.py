@@ -375,6 +375,90 @@ class Orchestrator:
 
     _POSITION_POLL_INIT_KEY = "position_poll_initialised"
 
+    def _check_price_alerts(self) -> int:
+        """
+        Check all active price alerts against current prices. Fire a
+        news_reactions notification for each alert whose condition is met,
+        and mark the alert inactive so it doesn't re-fire on the next poll.
+
+        One yfinance quote per unique ticker (not per alert) — alerts on
+        the same ticker share a quote.
+
+        Returns the number of alerts fired.
+        """
+        grouped = crud.get_active_alerts_grouped_by_ticker(self.db)
+        if not grouped:
+            return 0
+
+        from backend.tools.market_data import execute_market_data
+        fired = 0
+
+        for ticker, alerts in grouped.items():
+            try:
+                quote = execute_market_data(action="quote", ticker=ticker)
+            except Exception as exc:
+                logger.warning("Alert quote lookup failed for %s: %s", ticker, exc)
+                continue
+            if not isinstance(quote, dict) or not quote.get("price"):
+                continue
+            current_price = float(quote["price"])
+
+            for alert in alerts:
+                target = float(alert.target_price)
+                condition = alert.condition
+                hit = False
+                if condition == "above" and current_price >= target:
+                    hit = True
+                elif condition == "below" and current_price <= target:
+                    hit = True
+
+                if not hit:
+                    continue
+
+                # Compose a readable headline for the notification
+                direction = "above" if condition == "above" else "below"
+                headline = (
+                    f"{ticker} {direction} ${target:.2f} — now ${current_price:.2f}"
+                )
+                content_lines = [
+                    f"**Price alert fired:** {ticker} {direction} ${target:.2f}",
+                    "",
+                    f"- **Current price:** ${current_price:.2f}",
+                    f"- **Target:** ${target:.2f}",
+                    f"- **Condition:** {condition}",
+                ]
+                if alert.note:
+                    content_lines.append(f"- **Your note:** {alert.note}")
+                content_lines.append("")
+                content_lines.append(
+                    "Set from the Portfolio → Alerts section. This alert "
+                    "has been deactivated — create a new one if you want "
+                    "to watch the same level again."
+                )
+                content = "\n".join(content_lines)
+
+                try:
+                    crud.create_news_reaction(
+                        self.db,
+                        ticker=ticker,
+                        headline=headline,
+                        content=content,
+                        trigger_reason="price_alert",
+                        status="unread",
+                    )
+                    crud.mark_alert_triggered(self.db, alert.id, current_price)
+                    fired += 1
+                    logger.info(
+                        "Price alert fired: %s %s $%.2f (current $%.2f)",
+                        ticker, direction, target, current_price,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to fire alert for %s: %s", ticker, exc
+                    )
+
+        return fired
+
     def _snapshot_equity(self, broker) -> None:
         """
         Write one equity_snapshots row using the current broker account.
@@ -447,6 +531,15 @@ class Orchestrator:
         # non-fatal — we log and continue so equity-write issues can't
         # break the position review pipeline.
         self._snapshot_equity(broker)
+
+        # Check price alerts — fires notifications when watched levels
+        # are hit. Uses yfinance (via market_data tool) for quotes so
+        # it works for any ticker, not just currently-held positions.
+        # Non-fatal on any failure.
+        try:
+            self._check_price_alerts()
+        except Exception as exc:
+            logger.warning("Price alert check failed: %s", exc)
 
         try:
             current_positions = broker.get_positions()

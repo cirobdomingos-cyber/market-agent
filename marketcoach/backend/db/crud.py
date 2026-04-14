@@ -19,6 +19,7 @@ from backend.db.models import (
     NewsReaction,
     Position,
     PositionSnapshot,
+    PriceAlert,
     Signal,
     Thesis,
     TradeIdea,
@@ -606,6 +607,72 @@ def count_journal_entries_needing_action(db: Session) -> int:
         .scalar()
         or 0
     )
+
+
+# -- Price alerts --------------------------------------------------------------
+
+def create_price_alert(db: Session, **kwargs) -> PriceAlert:
+    alert = PriceAlert(**kwargs)
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    return alert
+
+
+def list_price_alerts(
+    db: Session,
+    active_only: bool = False,
+) -> list[PriceAlert]:
+    """Newest-first list of price alerts, optionally only the active ones."""
+    q = db.query(PriceAlert)
+    if active_only:
+        q = q.filter(PriceAlert.active == True)  # noqa: E712
+    return q.order_by(PriceAlert.created_at.desc()).all()
+
+
+def get_active_alerts_grouped_by_ticker(
+    db: Session,
+) -> dict[str, list[PriceAlert]]:
+    """
+    Return active alerts grouped by ticker, for the polling loop.
+    One yfinance quote per ticker lets us check all alerts on that
+    ticker at once instead of N quotes for N alerts on the same symbol.
+    """
+    alerts = (
+        db.query(PriceAlert)
+        .filter(PriceAlert.active == True)  # noqa: E712
+        .all()
+    )
+    by_ticker: dict[str, list[PriceAlert]] = {}
+    for a in alerts:
+        by_ticker.setdefault(a.ticker.upper(), []).append(a)
+    return by_ticker
+
+
+def mark_alert_triggered(
+    db: Session,
+    alert_id: str,
+    triggered_price: float,
+) -> Optional[PriceAlert]:
+    """Mark an alert as fired: set triggered_at / triggered_price, deactivate."""
+    alert = db.query(PriceAlert).filter(PriceAlert.id == alert_id).first()
+    if alert is None:
+        return None
+    alert.triggered_at = datetime.now(timezone.utc)
+    alert.triggered_price = triggered_price
+    alert.active = False
+    db.commit()
+    db.refresh(alert)
+    return alert
+
+
+def delete_price_alert(db: Session, alert_id: str) -> bool:
+    alert = db.query(PriceAlert).filter(PriceAlert.id == alert_id).first()
+    if alert is None:
+        return False
+    db.delete(alert)
+    db.commit()
+    return True
 
 
 # -- Equity snapshots ----------------------------------------------------------

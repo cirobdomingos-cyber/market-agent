@@ -197,6 +197,13 @@ class WatchlistAddRequest(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=500)
 
 
+class PriceAlertRequest(BaseModel):
+    ticker: str = Field(min_length=1, max_length=5, pattern=r"^[A-Za-z]{1,5}$")
+    condition: str = Field(pattern=r"^(above|below)$")
+    target_price: float = Field(gt=0)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
 class OrderConfirmRequest(BaseModel):
     """
     A user-confirmed trade proposal. The agent can never construct this
@@ -679,6 +686,67 @@ def delete_watchlist_ticker_route(
     if not ok:
         raise HTTPException(status_code=404, detail=f"Ticker {ticker} not on watchlist")
     return {"deleted": ticker.upper()}
+
+
+def _serialise_alert(a) -> dict:
+    return {
+        "id": a.id,
+        "ticker": a.ticker,
+        "condition": a.condition,
+        "target_price": a.target_price,
+        "note": a.note,
+        "active": a.active,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+        "triggered_at": a.triggered_at.isoformat() if a.triggered_at else None,
+        "triggered_price": a.triggered_price,
+    }
+
+
+@app.get("/alerts")
+def list_alerts(
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """List price alerts newest-first. active_only=true hides triggered ones."""
+    alerts = crud.list_price_alerts(db, active_only=active_only)
+    return [_serialise_alert(a) for a in alerts]
+
+
+@app.post("/alerts")
+def create_alert(
+    request: PriceAlertRequest,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """
+    Create a price alert. Fires via the 5-min position poll when current
+    price meets the condition. One-shot — after firing, the alert is
+    marked inactive and a news_reactions notification appears in the
+    Notifications tab with the price data.
+    """
+    alert = crud.create_price_alert(
+        db,
+        ticker=request.ticker.upper(),
+        condition=request.condition,
+        target_price=request.target_price,
+        note=request.note,
+        active=True,
+    )
+    return _serialise_alert(alert)
+
+
+@app.delete("/alerts/{alert_id}")
+def delete_alert(
+    alert_id: str,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Delete an alert (active or triggered). 404 if not found."""
+    ok = crud.delete_price_alert(db, alert_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"deleted": alert_id}
 
 
 @app.get("/equity-history")

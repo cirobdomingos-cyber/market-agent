@@ -153,6 +153,39 @@ class AutoRule(Base):
     created_at = Column(DateTime, default=_now_utc)
 
 
+class PriceAlert(Base):
+    """
+    A price-level alert on a ticker. Watches a current price and fires a
+    notification (persisted as a news_reactions row with trigger_reason=
+    'price_alert') when the condition is met.
+
+    V1 conditions:
+      - "above" → fires when current_price >= target_price
+      - "below" → fires when current_price <= target_price
+
+    V1 is one-shot: once triggered, the alert is marked inactive and
+    won't fire again. The user can explicitly re-arm by creating a new
+    alert. Avoids the "crosses above/below" edge case (requires knowing
+    the previous polled price) which belongs in v2.
+
+    The `note` field lets the user capture WHY they're watching this level
+    ("resistance for GLD trim", "support for TSLA entry") so future-them
+    reading the triggered notification remembers the context.
+    """
+
+    __tablename__ = "price_alerts"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    ticker = Column(String, nullable=False, index=True)
+    condition = Column(String, nullable=False)  # above | below
+    target_price = Column(Float, nullable=False)
+    note = Column(Text, nullable=True)
+    active = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, default=_now_utc)
+    triggered_at = Column(DateTime, nullable=True)
+    triggered_price = Column(Float, nullable=True)
+
+
 class WatchlistTicker(Base):
     """
     A ticker on the user's watchlist.
