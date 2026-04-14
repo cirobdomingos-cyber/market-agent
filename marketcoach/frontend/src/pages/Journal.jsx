@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import axios from 'axios'
+import TradePnlChart from '../components/TradePnlChart'
 
 const API = '/api'
 
@@ -318,31 +319,41 @@ function EntryCard({ entry, onChanged }) {
 }
 
 export default function Journal() {
-  const [entries, setEntries] = useState([])
+  // Single source of truth: all journal entries from the backend.
+  // The TradePnlChart uses the closed subset; each tab filters for display.
+  // Fetching once avoids duplicate requests and keeps the chart in sync
+  // with whatever the user is looking at.
+  const [allEntries, setAllEntries] = useState([])
   const [tab, setTab] = useState('action')
   const [loading, setLoading] = useState(true)
 
   const fetchEntries = async () => {
     setLoading(true)
     try {
-      // The "action" and "all" tabs both fetch all entries; "open"/"closed"
-      // delegate to the backend status filter.
-      let url = `${API}/journal?limit=200`
-      if (tab === 'open' || tab === 'closed') {
-        url += `&status=${tab}`
-      }
-      const res = await axios.get(url)
-      let data = res.data || []
-      if (tab === 'action') {
-        data = data.filter((e) => e.needs_action)
-      }
-      setEntries(data)
+      const res = await axios.get(`${API}/journal?limit=500`)
+      setAllEntries(res.data || [])
     } catch (err) {
       console.error('Failed to fetch journal:', err)
     } finally {
       setLoading(false)
     }
   }
+
+  // Derive the tab view from the full set
+  const entries = useMemo(() => {
+    const data = allEntries || []
+    if (tab === 'action') return data.filter((e) => e.needs_action)
+    if (tab === 'open') return data.filter((e) => e.status === 'open')
+    if (tab === 'closed') return data.filter((e) => e.status === 'closed')
+    return data  // 'all'
+  }, [allEntries, tab])
+
+  // Closed entries drive the TradePnlChart. Kept separate so the chart
+  // doesn't re-render when the user switches tabs (only the list does).
+  const closedEntries = useMemo(
+    () => (allEntries || []).filter((e) => e.status === 'closed'),
+    [allEntries]
+  )
 
   useEffect(() => {
     fetchEntries()
@@ -352,8 +363,7 @@ export default function Journal() {
     // wait long after an async close becomes visible.
     const id = setInterval(fetchEntries, 20_000)
     return () => clearInterval(id)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab])
+  }, [])
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -366,6 +376,11 @@ export default function Journal() {
           this is what builds calibration.
         </p>
       </div>
+
+      {/* Trade-by-trade P&L chart — complements the Dashboard's equity
+          curve. Realized-only, one point per closed trade, stays in sync
+          with whatever tab is active because they share the same data. */}
+      <TradePnlChart closedEntries={closedEntries} />
 
       <div className="flex gap-2 mb-4 border-b border-gray-800 overflow-x-auto">
         {TABS.map((t) => (
