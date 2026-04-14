@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
 import ChatWindow from '../components/ChatWindow'
@@ -38,6 +39,12 @@ export default function Advisor() {
   const [positions, setPositions] = useState([])
   const [error, setError] = useState(null)
   const messagesEndRef = useRef(null)
+  // Deep-link support: /advisor?prompt=... auto-sends that prompt on mount.
+  // Used by the "Ask Advisor" button on the Trade Ideas page. We track
+  // whether we've already fired the auto-send via a ref so React strict
+  // mode's double-mount doesn't send it twice.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const autoSentRef = useRef(false)
 
   useEffect(() => {
     let cancelled = false
@@ -89,6 +96,22 @@ export default function Advisor() {
       ])
     }
   }
+
+  // Auto-send the prompt from ?prompt=... on mount (deep-link from Trade
+  // Ideas "Ask Advisor" button). Runs exactly once per navigation.
+  useEffect(() => {
+    if (autoSentRef.current) return
+    const prompt = searchParams.get('prompt')
+    if (!prompt) return
+    autoSentRef.current = true
+    // Clear the query param so refreshing the page doesn't re-trigger
+    const next = new URLSearchParams(searchParams)
+    next.delete('prompt')
+    setSearchParams(next, { replace: true })
+    // Fire the send — handleSend is stable within this render tree
+    handleSend(prompt)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const alpacaConnected =
     account && account.status !== 'disconnected' && !account.error

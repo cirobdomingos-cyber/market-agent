@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import axios from 'axios'
 
 const API = '/api'
@@ -14,9 +15,49 @@ const HORIZON_LABELS = {
   long: '1-3 months',
 }
 
+/**
+ * Build a focused prompt asking the Advisor to re-validate a trade idea
+ * against current market data.
+ *
+ * Why we build this prompt here instead of just passing the ticker:
+ *   - The idea has stale numbers (entry, stop, target) from whenever the
+ *     pipeline generated it. The advisor needs to know those numbers so
+ *     it can check whether the setup is still intact against current price.
+ *   - The rationale is short context for the advisor — NOT a substitute
+ *     for the user's own thesis at execution time. The modal still forces
+ *     the user to type their own thesis before the trade goes through.
+ *   - By making this a text prompt instead of a structured payload, we
+ *     reuse the Advisor's normal message flow with zero backend changes.
+ */
+function buildAdvisorPrompt(idea) {
+  const horizonLabel = HORIZON_LABELS[idea.horizon] || idea.horizon
+  const conf = Math.round(idea.confidence * 100)
+  return (
+    `Review this trade idea from the pipeline and tell me if it's still actionable now.\n\n` +
+    `**${idea.direction.toUpperCase()} ${idea.ticker}** — ${horizonLabel}, ${conf}% confidence\n` +
+    `- Entry: $${idea.entry_price}\n` +
+    `- Stop loss: $${idea.stop_loss}\n` +
+    `- Take profit: $${idea.take_profit}\n` +
+    `- Position size: ${(idea.position_size_pct * 100).toFixed(1)}% of portfolio\n` +
+    `- Original rationale: "${idea.rationale}"\n\n` +
+    `Check current price via market_data, verify the thesis is still intact, ` +
+    `and if yes, give me a specific executable trade I can click. If the setup ` +
+    `has decayed (price moved past entry, thesis broken, etc.), say so and ` +
+    `tell me what's different now.`
+  )
+}
+
 export default function TradeIdeas() {
   const [ideas, setIdeas] = useState([])
   const [loading, setLoading] = useState(true)
+  const navigate = useNavigate()
+
+  const askAdvisor = (idea) => {
+    const prompt = buildAdvisorPrompt(idea)
+    // Use URL-encoded query param so the prompt survives the navigation.
+    // Advisor.jsx reads ?prompt= on mount and auto-sends it.
+    navigate(`/advisor?prompt=${encodeURIComponent(prompt)}`)
+  }
 
   const fetchIdeas = async () => {
     try {
@@ -75,6 +116,7 @@ export default function TradeIdeas() {
               idea={idea}
               onExecute={() => markExecuted(idea.id)}
               onCancel={() => markCancelled(idea.id)}
+              onAskAdvisor={() => askAdvisor(idea)}
             />
           ))}
         </div>
@@ -83,7 +125,7 @@ export default function TradeIdeas() {
   )
 }
 
-function TradeIdeaCard({ idea, onExecute, onCancel }) {
+function TradeIdeaCard({ idea, onExecute, onCancel, onAskAdvisor }) {
   const isLong = idea.direction === 'long'
   const colorClass = DIRECTION_COLORS[idea.direction] || DIRECTION_COLORS.long
   const confidencePct = Math.round(idea.confidence * 100)
@@ -111,15 +153,31 @@ function TradeIdeaCard({ idea, onExecute, onCancel }) {
           </span>
         </div>
         <div className="flex gap-2">
+          {/*
+            Primary action: hand this idea to the Advisor for fresh validation.
+            Deliberately NOT a direct "execute this now" button — the idea's
+            numbers can be hours stale, and we want every execution to go
+            through the Advisor's interactive checkpoint + required thesis
+            capture. This button just pre-fills the prompt and routes you
+            through the normal flow.
+          */}
+          <button
+            onClick={onAskAdvisor}
+            className="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-semibold transition-colors"
+            title="Ask the Advisor to re-validate this idea against current price and give you an executable trade"
+          >
+            Ask Advisor →
+          </button>
           <button
             onClick={onExecute}
-            className="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium transition-colors"
+            className="px-3 py-1.5 text-xs bg-gray-700 hover:bg-gray-600 rounded font-medium transition-colors"
+            title="Mark this idea as manually executed (tracking only — does not place an order)"
           >
             Mark Executed
           </button>
           <button
             onClick={onCancel}
-            className="px-3 py-1.5 text-xs bg-gray-700 hover:bg-gray-600 rounded font-medium transition-colors"
+            className="px-3 py-1.5 text-xs bg-gray-800 hover:bg-gray-700 text-gray-400 rounded font-medium transition-colors"
           >
             Cancel
           </button>
