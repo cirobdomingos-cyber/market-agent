@@ -681,6 +681,38 @@ def delete_watchlist_ticker_route(
     return {"deleted": ticker.upper()}
 
 
+@app.get("/equity-history")
+def get_equity_history(
+    days: int = Query(default=30, ge=1, le=365),
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """
+    Return equity time series over the last N days (default 30, max 365).
+
+    One row per polling cycle — the resolution is bounded by the
+    position poll interval (default 5 min → ~288 points/day). The
+    frontend uses this for the Dashboard's equity line chart and the
+    today/week/all-time P&L summary cards.
+
+    Returns rows ordered oldest → newest so the chart reads left-to-right.
+    Empty list if there's no history yet (e.g. fresh install).
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = crud.list_equity_snapshots(db, since=cutoff)
+    return [
+        {
+            "timestamp": r.snapshot_at.isoformat() if r.snapshot_at else None,
+            "equity": r.equity,
+            "buying_power": r.buying_power,
+            "cash": r.cash,
+            "portfolio_value": r.portfolio_value,
+        }
+        for r in rows
+    ]
+
+
 @app.get("/portfolio/orders")
 def get_order_history(
     limit: int = Query(default=20, ge=1, le=100),

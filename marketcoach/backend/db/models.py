@@ -252,6 +252,29 @@ class TradeJournalEntry(Base):
     created_at = Column(DateTime, default=_now_utc)
 
 
+class EquitySnapshot(Base):
+    """
+    Periodic snapshot of the account's equity / buying power / cash.
+
+    Written once per position-poll cycle (default 5 minutes) so the
+    Dashboard can render an equity curve over time. One row per poll,
+    NOT one row per ticker — that's the difference from PositionSnapshot.
+
+    The chart's resolution is bounded by the polling interval. 5 min
+    means ~288 points per day, ~2000 per week. Plenty for a line chart
+    without being wasteful.
+    """
+
+    __tablename__ = "equity_snapshots"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    equity = Column(Float, nullable=False)
+    buying_power = Column(Float, nullable=True)
+    cash = Column(Float, nullable=True)
+    portfolio_value = Column(Float, nullable=True)
+    snapshot_at = Column(DateTime, default=_now_utc, index=True)
+
+
 class PositionSnapshot(Base):
     """
     Periodic snapshot of one position at a point in time. Written by the

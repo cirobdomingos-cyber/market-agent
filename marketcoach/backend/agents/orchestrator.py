@@ -375,6 +375,46 @@ class Orchestrator:
 
     _POSITION_POLL_INIT_KEY = "position_poll_initialised"
 
+    def _snapshot_equity(self, broker) -> None:
+        """
+        Write one equity_snapshots row using the current broker account.
+        Called once per poll cycle. Any failure here is logged and
+        swallowed — this is telemetry, not critical path.
+        """
+        try:
+            account = broker.get_account()
+        except Exception as exc:
+            logger.warning("Equity snapshot: get_account failed: %s", exc)
+            return
+        if not isinstance(account, dict):
+            return
+        # Disconnected / error responses have no equity field
+        equity = account.get("equity")
+        if equity is None:
+            return
+        try:
+            crud.create_equity_snapshot(
+                self.db,
+                equity=float(equity),
+                buying_power=(
+                    float(account.get("buying_power"))
+                    if account.get("buying_power") is not None
+                    else None
+                ),
+                cash=(
+                    float(account.get("cash"))
+                    if account.get("cash") is not None
+                    else None
+                ),
+                portfolio_value=(
+                    float(account.get("portfolio_value"))
+                    if account.get("portfolio_value") is not None
+                    else None
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Equity snapshot: DB write failed: %s", exc)
+
     def _check_position_changes(self) -> int:
         """
         Poll the broker for current positions, diff against the latest stored
@@ -400,6 +440,13 @@ class Orchestrator:
         if broker is None:
             logger.debug("Position poll: no broker initialised, skipping")
             return 0
+
+        # Snapshot account equity regardless of position changes. This
+        # runs on every poll (including the first) so the Dashboard's
+        # equity chart has a data point every 5 minutes. Failures are
+        # non-fatal — we log and continue so equity-write issues can't
+        # break the position review pipeline.
+        self._snapshot_equity(broker)
 
         try:
             current_positions = broker.get_positions()

@@ -13,6 +13,7 @@ from backend.db.models import (
     AutoRule,
     BacktestRun,
     ChatMessage,
+    EquitySnapshot,
     ExecutedOrder,
     MorningBrief,
     NewsReaction,
@@ -604,6 +605,48 @@ def count_journal_entries_needing_action(db: Session) -> int:
         )
         .scalar()
         or 0
+    )
+
+
+# -- Equity snapshots ----------------------------------------------------------
+
+def create_equity_snapshot(db: Session, **kwargs) -> EquitySnapshot:
+    row = EquitySnapshot(**kwargs)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def list_equity_snapshots(
+    db: Session,
+    since: Optional[datetime] = None,
+    limit: Optional[int] = None,
+) -> list[EquitySnapshot]:
+    """
+    Return equity snapshots ordered by snapshot_at ASC (oldest first so the
+    chart reads left-to-right). Optionally filter to a time range or cap.
+    """
+    q = db.query(EquitySnapshot)
+    if since is not None:
+        # SQLite stores DateTime as naive — normalize
+        normalized = (
+            since.replace(tzinfo=None)
+            if since.tzinfo is not None
+            else since
+        )
+        q = q.filter(EquitySnapshot.snapshot_at >= normalized)
+    q = q.order_by(EquitySnapshot.snapshot_at.asc())
+    if limit is not None:
+        q = q.limit(limit)
+    return q.all()
+
+
+def get_latest_equity_snapshot(db: Session) -> Optional[EquitySnapshot]:
+    return (
+        db.query(EquitySnapshot)
+        .order_by(EquitySnapshot.snapshot_at.desc())
+        .first()
     )
 
 

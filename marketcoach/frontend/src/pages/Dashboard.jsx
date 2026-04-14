@@ -4,6 +4,7 @@ import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
 import SignalCard from '../components/SignalCard'
 import ThesisPanel from '../components/ThesisPanel'
+import EquityChart from '../components/EquityChart'
 
 const API = '/api'
 
@@ -186,6 +187,11 @@ export default function Dashboard() {
           </p>
         )}
       </div>
+
+      {/* Equity chart — shows how the account has progressed over time.
+          Backed by the equity_snapshots table, populated every 5 min by
+          the position polling job. */}
+      <EquityChart />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Signal Feed */}
