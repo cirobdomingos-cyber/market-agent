@@ -1,0 +1,165 @@
+"""
+Tests for agent base class helpers.
+
+Tests _extract_json and _serialise_content without making real API calls.
+These are the most important unit-testable parts of the agent layer.
+"""
+
+import pytest
+
+from backend.agents.base import BaseAgent, AgentResult
+from backend.agents.trading_advisor_agent import (
+    _fmt_money,
+    _format_positions,
+    _format_theses,
+    SYSTEM_PROMPT_TEMPLATE,
+)
+from backend.tools.alpaca import (
+    ALPACA_READ_TOOL,
+    _READ_ONLY_ACTIONS,
+    execute_alpaca_read_tool,
+)
+
+
+class TestExtractJson:
+    """Test the JSON extraction from Claude responses."""
+
+    def test_raw_json(self):
+        text = '{"signals": [{"ticker": "NVDA"}]}'
+        result = BaseAgent._extract_json(text)
+        assert result == {"signals": [{"ticker": "NVDA"}]}
+
+    def test_code_fenced_json(self):
+        text = 'Here is the analysis:\n```json\n{"theses": []}\n```\nDone.'
+        result = BaseAgent._extract_json(text)
+        assert result == {"theses": []}
+
+    def test_code_fence_without_language(self):
+        text = '```\n{"key": "value"}\n```'
+        result = BaseAgent._extract_json(text)
+        assert result == {"key": "value"}
+
+    def test_invalid_json_raises(self):
+        with pytest.raises(Exception):
+            BaseAgent._extract_json("not json at all")
+
+    def test_nested_json(self):
+        text = '```json\n{"a": {"b": [1, 2, 3]}}\n```'
+        result = BaseAgent._extract_json(text)
+        assert result["a"]["b"] == [1, 2, 3]
+
+
+class TestSerialiseContent:
+    """Test content block serialisation for message history."""
+
+    def test_dict_passthrough(self):
+        blocks = [{"type": "text", "text": "hello"}]
+        result = BaseAgent._serialise_content(blocks)
+        assert result == [{"type": "text", "text": "hello"}]
+
+    def test_pydantic_model_dump(self):
+        """Objects with model_dump() should be serialised via that method."""
+        class FakeBlock:
+            def model_dump(self):
+                return {"type": "text", "text": "from pydantic"}
+
+        result = BaseAgent._serialise_content([FakeBlock()])
+        assert result == [{"type": "text", "text": "from pydantic"}]
+
+
+class TestAgentResult:
+    def test_defaults(self):
+        result = AgentResult(success=True, data={"key": "value"})
+        assert result.success is True
+        assert result.error is None
+        assert result.run_at is not None
+
+    def test_failure(self):
+        result = AgentResult(success=False, data={}, error="something broke")
+        assert result.success is False
+        assert result.error == "something broke"
+
+
+class TestTradingAdvisorPrompt:
+    """Verify the trading advisor's prompt helpers and template rendering."""
+
+    def test_fmt_money_float(self):
+        assert _fmt_money(12345.6) == "$12,345.60"
+
+    def test_fmt_money_missing(self):
+        assert _fmt_money(None) == "not connected"
+
+    def test_format_positions_empty(self):
+        assert _format_positions([]) == "No open positions."
+
+    def test_format_positions_renders_ticker_and_pnl(self):
+        out = _format_positions([
+            {"ticker": "NVDA", "qty": 10, "avg_entry": 400.0,
+             "current_price": 450.0, "unrealised_pnl_pct": 12.5},
+        ])
+        assert "NVDA" in out
+        assert "12.5" in out
+
+    def test_format_theses_empty(self):
+        assert _format_theses([]) == "No open theses."
+
+    def test_template_renders_with_all_fields(self):
+        """The template must format cleanly when every context field is supplied."""
+        from backend.agents.trading_advisor_agent import _mode_banner
+
+        rendered = SYSTEM_PROMPT_TEMPLATE.format(
+            mode_banner=_mode_banner("paper"),
+            mode_label="paper",
+            portfolio_value="$100,000.00",
+            buying_power="$200,000.00",
+            cash="$50,000.00",
+            positions="  NVDA: 10 @ avg $400",
+            signals="  TSLA [bullish]: earnings beat",
+            theses="  AAPL (LONG, 0.7): iPhone cycle",
+            trade_proposal_addendum="",
+        )
+        # Key framework anchors must be present
+        assert "Layer 1 — Macro Regime" in rendered
+        assert "Layer 4 — Trade Decision Matrix" in rendered
+        assert "2% rule" in rendered
+        assert "$100,000.00" in rendered
+
+
+class TestAlpacaReadTool:
+    """Read-only Alpaca tool must refuse writes and expose the right surface."""
+
+    def test_tool_name_is_distinct_from_full_tool(self):
+        """The advisor sees a differently-named tool so it won't confuse the two."""
+        assert ALPACA_READ_TOOL["name"] == "alpaca_account"
+
+    def test_tool_schema_enum_is_read_only(self):
+        allowed = ALPACA_READ_TOOL["input_schema"]["properties"]["action"]["enum"]
+        assert set(allowed) == {"get_positions", "get_account", "get_order_history"}
+        assert "place_order" not in allowed
+        assert "close_position" not in allowed
+
+    def test_read_only_actions_constant_matches_schema(self):
+        """_READ_ONLY_ACTIONS must stay in sync with the tool schema enum."""
+        schema_enum = set(
+            ALPACA_READ_TOOL["input_schema"]["properties"]["action"]["enum"]
+        )
+        assert _READ_ONLY_ACTIONS == schema_enum
+
+    def test_write_action_rejected(self):
+        """place_order must be rejected without touching the Alpaca client."""
+        result = execute_alpaca_read_tool("place_order", ticker="NVDA", qty=1, side="buy")
+        assert "error" in result
+        assert "read-only" in result["error"].lower()
+
+    def test_close_position_rejected(self):
+        result = execute_alpaca_read_tool("close_position", ticker="NVDA")
+        assert "error" in result
+        assert "read-only" in result["error"].lower()
+
+    def test_read_action_with_no_client_returns_clean_error(self):
+        """With no client initialised, get_positions should surface a clear error."""
+        # In the test suite _client_instance is None — execute_alpaca_tool
+        # returns an explicit "not initialised" error, not a crash.
+        result = execute_alpaca_read_tool("get_positions")
+        assert "error" in result
+        assert "not initialised" in result["error"].lower()

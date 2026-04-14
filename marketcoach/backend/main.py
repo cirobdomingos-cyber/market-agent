@@ -1,0 +1,1080 @@
+"""
+MarketCoach -- FastAPI application entry point.
+
+Routes:
+  GET  /health                  -- liveness check
+  GET  /signals                 -- paginated signal feed
+  GET  /theses                  -- paginated theses (open or all)
+  GET  /accuracy                -- thesis accuracy stats
+  POST /pipeline/run            -- trigger intelligence pipeline manually
+  POST /chat                    -- send a message to the coach
+  GET  /chat/{session_id}       -- fetch session message history
+  GET  /portfolio               -- paper positions + account (Alpaca)
+  GET  /portfolio/orders        -- recent order history
+  GET  /profile                 -- user memory / preferences
+  POST /profile                 -- manually set a user memory
+  POST /backtest/run            -- start a new backtest simulation
+  GET  /backtests               -- list past backtest runs
+  GET  /backtest/{run_id}       -- fetch full backtest results
+  GET  /events                  -- upcoming earnings + FOMC dates for watchlist tickers
+"""
+
+import json
+import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
+
+from backend.config import settings
+from backend.db import get_db, init_db
+from backend.db import crud
+from backend.agents.orchestrator import Orchestrator
+from backend.scheduler import start_scheduler, stop_scheduler
+from backend.tools.alpaca import AlpacaClient, init_alpaca_client, get_alpaca_client
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+# -- Auth dependency -----------------------------------------------------------
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def require_auth(
+    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+) -> str:
+    """
+    Simple bearer-token auth. Set API_SECRET in .env to enable.
+    When API_SECRET is empty (dev mode), auth is bypassed.
+    """
+    if not settings.api_secret:
+        return "dev"
+    if credentials is None or credentials.credentials != settings.api_secret:
+        raise HTTPException(status_code=401, detail="Invalid or missing API token")
+    return credentials.credentials
+
+
+# -- App lifecycle -------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("MarketCoach starting up")
+    init_db()
+
+    # Initialize the Alpaca client singleton (if keys are configured).
+    # Trading mode is gated by a dual switch: alpaca_paper=False is not
+    # enough on its own — the confirmation phrase must also be set. If the
+    # user sets paper=False without the phrase, we refuse to start live and
+    # fall back to paper with a loud warning.
+    if settings.alpaca_api_key and settings.alpaca_secret_key:
+        is_live = settings.is_live_mode
+        if settings.alpaca_paper is False and not is_live:
+            logger.warning(
+                "ALPACA_PAPER=false but ALPACA_LIVE_CONFIRMATION is missing or "
+                "incorrect. Refusing to start in live mode — falling back to "
+                "paper. Set ALPACA_LIVE_CONFIRMATION='%s' to enable live.",
+                settings.LIVE_CONFIRMATION_PHRASE,
+            )
+        init_alpaca_client(
+            api_key=settings.alpaca_api_key,
+            secret_key=settings.alpaca_secret_key,
+            paper=not is_live,
+        )
+        if is_live:
+            logger.warning(
+                "═══════════════════════════════════════════════════════════"
+            )
+            logger.warning("  ALPACA CLIENT INITIALISED IN LIVE MODE")
+            logger.warning("  Real capital is at risk. Automation disabled.")
+            logger.warning(
+                "═══════════════════════════════════════════════════════════"
+            )
+        else:
+            logger.info("Alpaca client initialised (paper mode)")
+
+    start_scheduler()
+    yield
+    stop_scheduler()
+    logger.info("MarketCoach shut down")
+
+
+app = FastAPI(
+    title="MarketCoach API",
+    description="AI-powered market intelligence and personal finance coach",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Return clean JSON for unhandled errors instead of raw tracebacks."""
+    error_name = type(exc).__name__
+    if "RateLimitError" in error_name or "429" in str(exc):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limited by the AI provider. Please wait a minute and try again."},
+        )
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Check the server logs for details."},
+    )
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# -- Request/response models ---------------------------------------------------
+
+class ChatRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    message: str = Field(min_length=1, max_length=4000)
+
+
+class OrderConfirmRequest(BaseModel):
+    """
+    A user-confirmed trade proposal. The agent can never construct this
+    directly — it must come from a click on the Execute button in the UI,
+    which forwards a parsed trade-proposal block from an advisor message.
+    """
+    ticker: str = Field(min_length=1, max_length=5, pattern=r"^[A-Z]{1,5}$")
+    side: str = Field(pattern=r"^(buy|sell)$")
+    qty: float = Field(gt=0, le=10_000)
+    order_type: str = Field(pattern=r"^(market|limit)$")
+    limit_price: Optional[float] = Field(default=None, gt=0)
+    rationale: Optional[str] = Field(default=None, max_length=500)
+    advisor_session_id: Optional[str] = Field(default=None, max_length=64)
+    # Live mode safety: this field MUST be present and True when the system
+    # is in live mode. The frontend modal collects an explicit checkbox for it.
+    confirm_live_capital: bool = False
+
+
+class PipelineRunResponse(BaseModel):
+    status: dict
+    message: str
+
+
+class MemoryRequest(BaseModel):
+    key: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
+    value: str = Field(min_length=1, max_length=1000)
+    category: str = Field(default="general", pattern=r"^(profile|preference|observation|general)$")
+
+
+class BacktestRequest(BaseModel):
+    start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$", description="YYYY-MM-DD")
+    end_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    initial_capital: float = Field(default=100_000.0, ge=1_000, le=10_000_000)
+    watchlist: list[str] | None = None
+    decision_interval_days: int = Field(default=7, ge=1, le=30)
+    risk_tolerance: str = Field(default="moderate", pattern=r"^(conservative|moderate|aggressive)$")
+
+
+# -- Routes --------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    alpaca = get_alpaca_client()
+    return {
+        "status": "ok",
+        "version": "0.2.0",
+        "alpaca_connected": alpaca is not None and alpaca._client is not None,
+    }
+
+
+@app.get("/signals")
+def get_signals(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    ticker: str | None = None,
+    hours: int = Query(default=24, ge=1, le=720),
+    db: Session = Depends(get_db),
+):
+    if ticker:
+        signals = crud.get_recent_signals(db, hours=hours, ticker=ticker.upper())
+    else:
+        signals = crud.get_signals_page(db, skip=skip, limit=limit)
+
+    return [
+        {
+            "id": s.id,
+            "ticker": s.ticker,
+            "sentiment": s.sentiment,
+            "confidence": s.confidence,
+            "source": s.source,
+            "headline": s.headline,
+            "created_at": s.created_at.isoformat(),
+        }
+        for s in signals
+    ]
+
+
+@app.get("/theses")
+def get_theses(
+    open_only: bool = False,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    theses = crud.get_open_theses(db) if open_only else crud.get_theses_page(db, skip, limit)
+
+    return [
+        {
+            "id": t.id,
+            "ticker": t.ticker,
+            "direction": t.direction,
+            "confidence": t.confidence,
+            "timeframe": t.timeframe,
+            "reasoning": t.reasoning,
+            "key_risks": json.loads(t.key_risks) if t.key_risks else [],
+            "created_at": t.created_at.isoformat(),
+            "resolved_at": t.resolved_at.isoformat() if t.resolved_at else None,
+            "outcome": t.outcome,
+            "accuracy": t.accuracy,
+        }
+        for t in theses
+    ]
+
+
+@app.get("/accuracy")
+def get_accuracy(db: Session = Depends(get_db)):
+    return crud.get_accuracy_stats(db)
+
+
+@app.post("/pipeline/run", response_model=PipelineRunResponse)
+def run_pipeline(
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Manually trigger the intelligence pipeline (news + analysis + resolution)."""
+    orchestrator = Orchestrator(db)
+    results = orchestrator.run_intelligence_pipeline()
+    status = orchestrator.get_pipeline_status(results)
+
+    all_ok = all(r.success for r in results.values())
+    return PipelineRunResponse(
+        status=status,
+        message="Pipeline completed successfully" if all_ok else "Pipeline completed with errors",
+    )
+
+
+@app.post("/chat")
+def chat(
+    request: ChatRequest,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Send a message to the coach and get a response."""
+    orchestrator = Orchestrator(db)
+
+    theses = crud.get_open_theses(db, limit=5)
+    signals = crud.get_recent_signals(db, hours=4)
+    accuracy = crud.get_accuracy_stats(db)
+
+    # Load user profile for personalized coaching
+    user_profile = orchestrator.get_user_profile()
+
+    context = {
+        "session_id": request.session_id,
+        "user_message": request.message,
+        "portfolio": [],  # populated by orchestrator from Alpaca
+        "theses": [
+            {
+                "ticker": t.ticker,
+                "direction": t.direction,
+                "confidence": t.confidence,
+                "timeframe": t.timeframe,
+                "reasoning": t.reasoning[:200],
+            }
+            for t in theses
+        ],
+        "signals": [
+            {"ticker": s.ticker, "sentiment": s.sentiment, "headline": s.headline}
+            for s in signals[:10]
+        ],
+        "accuracy": accuracy,
+        "user_profile": user_profile,
+    }
+
+    result = orchestrator.run_coach(context)
+    if not result.success:
+        raise HTTPException(status_code=500, detail=result.error)
+
+    return {
+        "session_id": result.data.get("session_id"),
+        "response": result.data.get("reply", ""),
+    }
+
+
+def _serialise_news_reaction(r) -> dict:
+    return {
+        "id": r.id,
+        "ticker": r.ticker,
+        "headline": r.headline,
+        "content": r.content,
+        "trigger_reason": r.trigger_reason,
+        "status": r.status,
+        "error": r.error,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+@app.get("/news-reactions")
+def list_news_reactions(
+    status: str | None = None,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """List news reactions newest first. Optional status filter (unread/read/dismissed/failed)."""
+    if status is not None and status not in ("unread", "read", "dismissed", "failed"):
+        raise HTTPException(status_code=422, detail="Invalid status filter")
+    reactions = crud.list_news_reactions(
+        db, status=status, limit=min(max(1, limit), 200)
+    )
+    return [_serialise_news_reaction(r) for r in reactions]
+
+
+@app.get("/news-reactions/unread-count")
+def get_unread_reaction_count(
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Lightweight count for the nav badge — polled every 60s by the UI."""
+    return {"unread": crud.count_unread_reactions(db)}
+
+
+@app.post("/news-reactions/{reaction_id}/read")
+def mark_reaction_read(
+    reaction_id: str,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    reaction = crud.update_reaction_status(db, reaction_id, "read")
+    if reaction is None:
+        raise HTTPException(status_code=404, detail="Reaction not found")
+    return _serialise_news_reaction(reaction)
+
+
+@app.post("/news-reactions/{reaction_id}/dismiss")
+def dismiss_reaction(
+    reaction_id: str,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    reaction = crud.update_reaction_status(db, reaction_id, "dismissed")
+    if reaction is None:
+        raise HTTPException(status_code=404, detail="Reaction not found")
+    return _serialise_news_reaction(reaction)
+
+
+@app.get("/mode")
+def get_trading_mode():
+    """
+    Return the current trading mode so the frontend can render a live-mode
+    banner. Intentionally unauthenticated and side-effect-free — this is the
+    one status check that should always work, even before login.
+    """
+    return {
+        "mode": settings.trading_mode,
+        "is_live": settings.is_live_mode,
+        "paper_flag": settings.alpaca_paper,
+        "confirmation_set": bool(settings.alpaca_live_confirmation),
+    }
+
+
+def _serialise_weekly_plan(plan) -> dict:
+    return {
+        "id": plan.id,
+        "session_id": plan.session_id,
+        "content": plan.content,
+        "status": plan.status,
+        "error": plan.error,
+        "trigger": plan.trigger,
+        "created_at": plan.created_at.isoformat() if plan.created_at else None,
+    }
+
+
+@app.get("/weekly-plan/latest")
+def get_latest_weekly_plan(
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Return the most recently generated weekly plan, or 404 if none exist."""
+    plan = crud.get_latest_weekly_plan(db)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="No weekly plan generated yet")
+    return _serialise_weekly_plan(plan)
+
+
+@app.get("/weekly-plan")
+def list_weekly_plans(
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """List recent weekly plans, newest first."""
+    plans = crud.list_weekly_plans(db, limit=min(max(1, limit), 50))
+    return [_serialise_weekly_plan(p) for p in plans]
+
+
+def _serialise_morning_brief(brief) -> dict:
+    return {
+        "id": brief.id,
+        "session_id": brief.session_id,
+        "content": brief.content,
+        "status": brief.status,
+        "error": brief.error,
+        "trigger": brief.trigger,
+        "created_at": brief.created_at.isoformat() if brief.created_at else None,
+    }
+
+
+@app.get("/morning-brief/latest")
+def get_latest_morning_brief(
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Return the most recent morning brief, or 404 if none exist yet."""
+    brief = crud.get_latest_morning_brief(db)
+    if brief is None:
+        raise HTTPException(status_code=404, detail="No morning brief generated yet")
+    return _serialise_morning_brief(brief)
+
+
+@app.get("/morning-brief")
+def list_morning_briefs(
+    limit: int = 14,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """List recent morning briefs, newest first. Default 14 = ~2 weeks of weekdays."""
+    briefs = crud.list_morning_briefs(db, limit=min(max(1, limit), 60))
+    return [_serialise_morning_brief(b) for b in briefs]
+
+
+@app.post("/morning-brief/run")
+def run_morning_brief_now(
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Manually trigger a morning brief generation — used by the 'Run now' UI button."""
+    orchestrator = Orchestrator(db)
+    result = orchestrator.run_morning_brief(trigger="manual")
+    if not result.success:
+        raise HTTPException(status_code=500, detail=result.error)
+    brief = crud.get_latest_morning_brief(db)
+    return _serialise_morning_brief(brief)
+
+
+@app.post("/weekly-plan/run")
+def run_weekly_plan_now(
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Manually trigger a weekly plan generation. Used by the 'Run now' UI button."""
+    orchestrator = Orchestrator(db)
+    result = orchestrator.run_weekly_plan(trigger="manual")
+    if not result.success:
+        raise HTTPException(status_code=500, detail=result.error)
+    plan = crud.get_latest_weekly_plan(db)
+    return _serialise_weekly_plan(plan)
+
+
+@app.post("/advisor")
+def advisor(
+    request: ChatRequest,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Send a message to the trading advisor and get a decisive response."""
+    orchestrator = Orchestrator(db)
+
+    theses = crud.get_open_theses(db, limit=5)
+    signals = crud.get_recent_signals(db, hours=4)
+
+    context = {
+        "session_id": request.session_id,
+        "user_message": request.message,
+        # Only the user-facing chat path enables structured trade proposals.
+        # Briefs/news-reactions/weekly-plans intentionally never emit them —
+        # nobody clicks Execute on a 06:00 brief while half-asleep.
+        "enable_trade_proposals": True,
+        "theses": [
+            {
+                "ticker": t.ticker,
+                "direction": t.direction,
+                "confidence": t.confidence,
+                "timeframe": t.timeframe,
+                "reasoning": t.reasoning[:200],
+            }
+            for t in theses
+        ],
+        "signals": [
+            {"ticker": s.ticker, "sentiment": s.sentiment, "headline": s.headline}
+            for s in signals[:10]
+        ],
+    }
+
+    result = orchestrator.run_advisor(context)
+    if not result.success:
+        raise HTTPException(status_code=500, detail=result.error)
+
+    return {
+        "session_id": result.data.get("session_id"),
+        "response": result.data.get("reply", ""),
+    }
+
+
+@app.get("/chat/{session_id}")
+def get_chat_history(session_id: str, db: Session = Depends(get_db)):
+    messages = crud.get_session_messages(db, session_id)
+    return [
+        {
+            "id": m.id,
+            "role": m.role,
+            "content": m.content,
+            "created_at": m.created_at.isoformat(),
+        }
+        for m in messages
+    ]
+
+
+# -- Portfolio -----------------------------------------------------------------
+
+@app.get("/portfolio")
+def get_portfolio(_auth: str = Depends(require_auth)):
+    """Return paper positions and account summary from Alpaca."""
+    client = get_alpaca_client()
+    if client is None:
+        return {
+            "account": {"status": "disconnected", "message": "Alpaca not configured"},
+            "positions": [],
+        }
+    return {
+        "account": client.get_account(),
+        "positions": client.get_positions(),
+    }
+
+
+@app.get("/portfolio/orders")
+def get_order_history(
+    limit: int = Query(default=20, ge=1, le=100),
+    _auth: str = Depends(require_auth),
+):
+    """Return recent order history from Alpaca."""
+    client = get_alpaca_client()
+    if client is None:
+        return []
+    return client.get_order_history(limit=limit)
+
+
+# -- Order execution -----------------------------------------------------------
+#
+# Defence in depth — every layer must allow the order before it reaches Alpaca:
+#   1. Pydantic schema  (in OrderConfirmRequest)
+#   2. Live mode gate   (settings.is_live_mode → confirm_live_capital must be True)
+#   3. Alpaca connected (no-op if client missing)
+#   4. Daily order cap  (max N orders per 24h, prevents runaway)
+#   5. Ticker whitelist (must be a position, open thesis, or watchlist ticker)
+#   6. 20% rule         (order notional ≤ 20% of portfolio value)
+# Every attempt — accepted OR rejected — gets a row in executed_orders.
+
+ORDER_DAILY_CAP = 20
+PORTFOLIO_MAX_PCT = 0.20
+
+
+def _serialise_executed_order(o) -> dict:
+    return {
+        "id": o.id,
+        "alpaca_order_id": o.alpaca_order_id,
+        "ticker": o.ticker,
+        "side": o.side,
+        "qty": o.qty,
+        "order_type": o.order_type,
+        "limit_price": o.limit_price,
+        "fill_price": o.fill_price,
+        "status": o.status,
+        "rejection_reason": o.rejection_reason,
+        "is_paper": o.is_paper,
+        "rationale": o.rationale,
+        "advisor_session_id": o.advisor_session_id,
+        "submitted_at": o.submitted_at.isoformat() if o.submitted_at else None,
+        "filled_at": o.filled_at.isoformat() if o.filled_at else None,
+        "created_at": o.created_at.isoformat() if o.created_at else None,
+    }
+
+
+def _persist_rejection(db: Session, request: OrderConfirmRequest, reason: str) -> dict:
+    """Record a rejected order attempt and return the serialised row."""
+    rejected = crud.create_executed_order(
+        db,
+        ticker=request.ticker,
+        side=request.side,
+        qty=request.qty,
+        order_type=request.order_type,
+        limit_price=request.limit_price,
+        status="rejected",
+        rejection_reason=reason,
+        is_paper=not settings.is_live_mode,
+        rationale=request.rationale,
+        advisor_session_id=request.advisor_session_id,
+    )
+    return _serialise_executed_order(rejected)
+
+
+@app.post("/orders/confirm")
+def confirm_order(
+    request: OrderConfirmRequest,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """
+    Execute a user-confirmed trade. Comes from the Execute button in the
+    Advisor UI, never from the agent directly. Goes through every safety
+    gate before touching Alpaca.
+    """
+    # Schema-level: limit_price required when order_type=limit
+    if request.order_type == "limit" and request.limit_price is None:
+        raise HTTPException(
+            status_code=422,
+            detail="limit_price is required when order_type is 'limit'",
+        )
+    if request.order_type == "market" and request.limit_price is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="limit_price must be null when order_type is 'market'",
+        )
+
+    # Gate 2 — live-mode confirmation
+    if settings.is_live_mode and not request.confirm_live_capital:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "System is in live mode. Set confirm_live_capital=true in the "
+                "request body to acknowledge real capital is at risk."
+            ),
+        )
+
+    # Gate 3 — Alpaca must be connected
+    client = get_alpaca_client()
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Alpaca client not configured. Set ALPACA_API_KEY and ALPACA_SECRET_KEY.",
+        )
+
+    # Gate 4 — daily order cap
+    today_count = crud.count_orders_today(db)
+    if today_count >= ORDER_DAILY_CAP:
+        return _persist_rejection(
+            db, request,
+            f"Daily order cap reached ({today_count}/{ORDER_DAILY_CAP}). "
+            "Wait 24h or raise ORDER_DAILY_CAP."
+        )
+
+    # Gate 5 — ticker whitelist (positions ∪ open theses ∪ watchlist)
+    whitelist: set[str] = set()
+    try:
+        whitelist.update(
+            (p.get("ticker") or "").upper() for p in client.get_positions()
+        )
+    except Exception as exc:
+        logger.warning("Failed to load positions for whitelist: %s", exc)
+    whitelist.update(
+        (t.ticker or "").upper() for t in crud.get_open_theses(db, limit=100)
+    )
+    whitelist.update(t.upper() for t in settings.watchlist)
+
+    if request.ticker not in whitelist:
+        return _persist_rejection(
+            db, request,
+            f"Ticker {request.ticker} is not in the whitelist (positions, "
+            "open theses, or watchlist). Add it to your watchlist or open a "
+            "thesis on it before trading.",
+        )
+
+    # Gate 6 — 20% portfolio rule (use limit_price for limit orders, else fall
+    # back to current quote via market_data; if neither, use a conservative
+    # estimate from the user's account)
+    try:
+        account = client.get_account()
+        portfolio_value = float(account.get("portfolio_value") or 0)
+    except Exception as exc:
+        logger.warning("Failed to load account for sizing check: %s", exc)
+        portfolio_value = 0
+
+    estimated_price = request.limit_price
+    if estimated_price is None:
+        # market order — fetch current quote
+        from backend.tools.market_data import execute_market_data
+        quote = execute_market_data(action="quote", ticker=request.ticker)
+        if isinstance(quote, dict) and "price" in quote and quote["price"]:
+            estimated_price = float(quote["price"])
+
+    if estimated_price and portfolio_value:
+        notional = estimated_price * request.qty
+        max_notional = portfolio_value * PORTFOLIO_MAX_PCT
+        if notional > max_notional:
+            return _persist_rejection(
+                db, request,
+                f"Order notional ${notional:,.0f} exceeds 20% of portfolio "
+                f"(${max_notional:,.0f}). Reduce qty or raise PORTFOLIO_MAX_PCT.",
+            )
+
+    # All gates passed — submit to Alpaca
+    from datetime import datetime, timezone
+    try:
+        result = client.place_order(
+            ticker=request.ticker,
+            qty=request.qty,
+            side=request.side,
+            paper_only=not settings.is_live_mode,
+        )
+    except Exception as exc:
+        logger.exception("Alpaca place_order failed for %s", request.ticker)
+        failed = crud.create_executed_order(
+            db,
+            ticker=request.ticker,
+            side=request.side,
+            qty=request.qty,
+            order_type=request.order_type,
+            limit_price=request.limit_price,
+            status="failed",
+            rejection_reason=str(exc),
+            is_paper=not settings.is_live_mode,
+            rationale=request.rationale,
+            advisor_session_id=request.advisor_session_id,
+        )
+        return _serialise_executed_order(failed)
+
+    persisted = crud.create_executed_order(
+        db,
+        alpaca_order_id=result.order_id,
+        ticker=result.ticker,
+        side=result.side,
+        qty=result.qty,
+        order_type=request.order_type,
+        limit_price=request.limit_price,
+        fill_price=result.fill_price,
+        status="filled" if result.fill_price else "accepted",
+        is_paper=result.is_paper,
+        rationale=request.rationale,
+        advisor_session_id=request.advisor_session_id,
+        submitted_at=datetime.now(timezone.utc),
+        filled_at=datetime.now(timezone.utc) if result.fill_price else None,
+    )
+    return _serialise_executed_order(persisted)
+
+
+@app.get("/orders/executed")
+def list_executed_orders(
+    status: Optional[str] = None,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """List orders MarketCoach placed, newest first. Optional status filter."""
+    if status is not None and status not in (
+        "accepted", "filled", "rejected", "failed"
+    ):
+        raise HTTPException(status_code=422, detail="Invalid status filter")
+    orders = crud.list_executed_orders(
+        db, status=status, limit=min(max(1, limit), 200)
+    )
+    return [_serialise_executed_order(o) for o in orders]
+
+
+# -- Trade ideas ---------------------------------------------------------------
+
+@app.get("/trade-ideas")
+def get_trade_ideas(
+    active_only: bool = True,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Return trade ideas (active by default, or all)."""
+    if active_only:
+        ideas = crud.get_active_trade_ideas(db, limit=limit)
+    else:
+        ideas = crud.get_trade_ideas_page(db, skip=skip, limit=limit)
+
+    return [
+        {
+            "id": i.id,
+            "thesis_id": i.thesis_id,
+            "ticker": i.ticker,
+            "direction": i.direction,
+            "strategy": i.strategy,
+            "horizon": i.horizon,
+            "entry_price": i.entry_price,
+            "stop_loss": i.stop_loss,
+            "take_profit": i.take_profit,
+            "current_price": i.current_price,
+            "confidence": i.confidence,
+            "risk_reward_ratio": i.risk_reward_ratio,
+            "position_size_pct": i.position_size_pct,
+            "max_loss_pct": i.max_loss_pct,
+            "rationale": i.rationale,
+            "key_levels": json.loads(i.key_levels) if i.key_levels else {},
+            "status": i.status,
+            "created_at": i.created_at.isoformat(),
+            "expires_at": i.expires_at.isoformat() if i.expires_at else None,
+        }
+        for i in ideas
+    ]
+
+
+@app.patch("/trade-ideas/{idea_id}")
+def update_trade_idea(
+    idea_id: str,
+    status: str = Query(pattern=r"^(executed|cancelled)$"),
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Mark a trade idea as executed or cancelled."""
+    from datetime import datetime, timezone
+    executed_at = datetime.now(timezone.utc) if status == "executed" else None
+    idea = crud.update_trade_idea_status(db, idea_id, status, executed_at)
+    if idea is None:
+        raise HTTPException(status_code=404, detail="Trade idea not found")
+    return {"id": idea.id, "status": idea.status}
+
+
+# -- User profile / memory ----------------------------------------------------
+
+@app.get("/profile")
+def get_profile(db: Session = Depends(get_db)):
+    """Return stored user preferences and profile memories."""
+    memories = crud.get_all_memories(db)
+    return {
+        "memories": [
+            {
+                "key": m.key,
+                "value": m.value,
+                "category": m.category,
+                "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+            }
+            for m in memories
+        ]
+    }
+
+
+@app.post("/profile")
+def set_profile_memory(
+    request: MemoryRequest,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Manually set a user preference or profile memory."""
+    memory = crud.upsert_memory(
+        db, key=request.key, value=request.value, category=request.category,
+    )
+    return {
+        "key": memory.key,
+        "value": memory.value,
+        "category": memory.category,
+        "updated_at": memory.updated_at.isoformat() if memory.updated_at else None,
+    }
+
+
+# -- Backtest ------------------------------------------------------------------
+
+@app.post("/backtest/run")
+def run_backtest_endpoint(
+    request: BacktestRequest,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """
+    Run a time-machine backtest simulation.
+
+    This calls Claude at each decision point to generate theses from
+    historical technicals, then simulates the trades day-by-day.
+    May take 1-3 minutes depending on the date range and watchlist size.
+    """
+    from datetime import date, datetime, timedelta, timezone
+    from backend.backtest.schemas import BacktestConfig
+    from backend.backtest.engine import run_backtest
+
+    start = date.fromisoformat(request.start_date)
+    end = date.fromisoformat(request.end_date) if request.end_date else date.today() - timedelta(days=1)
+    watchlist = [t.strip().upper() for t in (request.watchlist or settings.watchlist)]
+
+    if start >= end:
+        raise HTTPException(status_code=400, detail="start_date must be before end_date")
+    if (end - start).days > 365:
+        raise HTTPException(status_code=400, detail="Maximum backtest window is 365 days")
+    if (end - start).days < 7:
+        raise HTTPException(status_code=400, detail="Minimum backtest window is 7 days")
+
+    config = BacktestConfig(
+        start_date=start,
+        end_date=end,
+        initial_capital=request.initial_capital,
+        watchlist=watchlist,
+        decision_interval_days=request.decision_interval_days,
+        risk_tolerance=request.risk_tolerance,
+    )
+
+    try:
+        result = run_backtest(config)
+    except Exception as exc:
+        logger.exception("Backtest failed")
+        raise HTTPException(status_code=500, detail=f"Backtest failed: {exc}")
+
+    # Persist to DB
+    crud.create_backtest_run(
+        db,
+        id=result.id,
+        config_json=result.config.model_dump_json(),
+        result_json=result.model_dump_json(),
+        status=result.status,
+        initial_capital=result.metrics.initial_capital,
+        final_equity=result.metrics.final_equity,
+        total_return_pct=result.metrics.total_return_pct,
+        total_trades=result.metrics.total_trades,
+        win_rate_pct=result.metrics.win_rate_pct,
+        max_drawdown_pct=result.metrics.max_drawdown_pct,
+        started_at=datetime.fromisoformat(result.started_at),
+        completed_at=datetime.fromisoformat(result.completed_at),
+    )
+
+    return result.model_dump()
+
+
+@app.get("/backtests")
+def list_backtests(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    """List past backtest runs (summary only, not full results)."""
+    runs = crud.get_backtest_runs(db, skip=skip, limit=limit)
+    return [
+        {
+            "id": r.id,
+            "status": r.status,
+            "initial_capital": r.initial_capital,
+            "final_equity": r.final_equity,
+            "total_return_pct": r.total_return_pct,
+            "total_trades": r.total_trades,
+            "win_rate_pct": r.win_rate_pct,
+            "max_drawdown_pct": r.max_drawdown_pct,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+        }
+        for r in runs
+    ]
+
+
+@app.get("/backtest/{run_id}")
+def get_backtest(run_id: str, db: Session = Depends(get_db)):
+    """Fetch full backtest results by ID."""
+    run = crud.get_backtest_run(db, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Backtest run not found")
+    return json.loads(run.result_json)
+
+
+# -- Market calendar -----------------------------------------------------------
+
+# FOMC scheduled rate-decision dates (second day of each meeting).
+# Update this list each year when the Fed publishes its schedule.
+_FOMC_DATES_2026 = [
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-10",
+    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+]
+
+
+@app.get("/events")
+def get_events(
+    year: int = Query(default=None, ge=2020, le=2030),
+    month: int = Query(default=None, ge=1, le=12),
+):
+    """
+    Return market events for a given month: upcoming earnings dates for all
+    watchlist tickers (sourced from yfinance) and FOMC rate-decision dates.
+    Defaults to the current month when year/month are omitted.
+    """
+    import calendar as cal_lib
+    from datetime import date
+
+    import pandas as pd
+    import yfinance as yf
+
+    today = date.today()
+    y = year if year is not None else today.year
+    m = month if month is not None else today.month
+
+    _, days_in_month = cal_lib.monthrange(y, m)
+    start = date(y, m, 1)
+    end = date(y, m, days_in_month)
+
+    events: list[dict] = []
+
+    # -- FOMC dates (extend list above for years beyond 2026) --
+    for d_str in _FOMC_DATES_2026:
+        d = date.fromisoformat(d_str)
+        if start <= d <= end:
+            events.append({
+                "date": d_str,
+                "type": "fomc",
+                "ticker": None,
+                "title": "FOMC Rate Decision",
+                "detail": "Federal Reserve interest rate decision",
+            })
+
+    # -- Earnings dates from yfinance for each watchlist ticker --
+    for ticker in settings.watchlist:
+        try:
+            t = yf.Ticker(ticker)
+            earn_df = t.earnings_dates
+            if earn_df is None or earn_df.empty:
+                continue
+
+            # Identify the "Reported EPS" column to skip already-reported dates.
+            reported_col = next(
+                (c for c in earn_df.columns if "Reported" in c), None
+            )
+
+            for idx in earn_df.index:
+                try:
+                    # Skip past earnings that have already been reported.
+                    if reported_col is not None and not pd.isna(earn_df.loc[idx, reported_col]):
+                        continue
+                    d = idx.date() if hasattr(idx, "date") else pd.Timestamp(idx).date()
+                    if start <= d <= end:
+                        events.append({
+                            "date": d.isoformat(),
+                            "type": "earnings",
+                            "ticker": ticker,
+                            "title": f"{ticker} Earnings",
+                            "detail": None,
+                        })
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.warning("Failed to fetch earnings for %s: %s", ticker, exc)
+            continue
+
+    events.sort(key=lambda x: x["date"])
+    return events

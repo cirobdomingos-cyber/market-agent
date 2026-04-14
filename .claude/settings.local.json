@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -3.12 -c \"import anthropic, fastapi, sqlalchemy, pydantic, apscheduler; print\\(''all good''\\)\")",
+      "WebSearch"
+    ]
+  }
+}

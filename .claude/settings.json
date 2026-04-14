@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from backend.backtest.schemas import BacktestConfig, BacktestResult, BacktestTrade, BacktestMetrics, EquityPoint; print\\('schemas OK'\\)\")",
+      "Bash(python -c \"from backend.backtest.simulator import PortfolioSimulator; print\\('simulator OK'\\)\")",
+      "Bash(python -c \"from backend.backtest.historical_data import get_historical_technicals, get_daily_prices; print\\('historical_data OK'\\)\")",
+      "Bash(python -c \"from backend.backtest.engine import run_backtest; print\\('engine OK'\\)\")",
+      "Bash(python -c \"from backend.db.models import BacktestRun; print\\('model OK'\\)\")",
+      "Bash(python -c \"from backend.db.crud import create_backtest_run, get_backtest_run, get_backtest_runs; print\\('crud OK'\\)\")",
+      "Bash(python -c \"from backend.main import app; routes = [r.path for r in app.routes]; print\\([p for p in routes if 'backtest' in str\\(p\\)]\\)\")",
+      "Bash(python -c ':*)"
+    ]
+  }
+}
