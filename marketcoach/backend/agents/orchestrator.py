@@ -43,7 +43,14 @@ class Orchestrator:
         The core scheduled pipeline: fetch news -> generate theses -> resolve expired.
         Runs every 4 hours via APScheduler.
         """
-        context = context or {"watchlist": settings.watchlist}
+        # Read the watchlist from the DB (not settings.watchlist, which is
+        # only the env-var initial seed). Fall back to settings.watchlist if
+        # the DB is empty — should never happen in practice because the
+        # lifespan seeds it on first startup, but defensive anyway.
+        db_watchlist = [
+            row.ticker for row in crud.list_watchlist_tickers(self.db)
+        ] or settings.watchlist
+        context = context or {"watchlist": db_watchlist}
         results: dict[str, AgentResult] = {}
 
         logger.info("Orchestrator: starting intelligence pipeline")
@@ -189,7 +196,7 @@ class Orchestrator:
         thesis_tickers = {
             (t.ticker or "").upper() for t in crud.get_open_theses(self.db, limit=100)
         }
-        watchlist_tickers = {t.upper() for t in settings.watchlist}
+        watchlist_tickers = crud.get_watchlist_tickers_set(self.db)
 
         candidates: list[tuple[dict, str, str]] = []
         for sig in impactful:

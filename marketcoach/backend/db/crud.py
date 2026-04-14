@@ -23,6 +23,7 @@ from backend.db.models import (
     TradeIdea,
     TradeJournalEntry,
     UserMemory,
+    WatchlistTicker,
     WeeklyPlan,
 )
 
@@ -425,6 +426,90 @@ def list_weekly_plans(db: Session, limit: int = 10) -> list[WeeklyPlan]:
         .limit(limit)
         .all()
     )
+
+
+# -- Watchlist -----------------------------------------------------------------
+
+def list_watchlist_tickers(db: Session) -> list[WatchlistTicker]:
+    """Return all watchlist rows, ordered alphabetically by ticker."""
+    return (
+        db.query(WatchlistTicker)
+        .order_by(WatchlistTicker.ticker.asc())
+        .all()
+    )
+
+
+def get_watchlist_tickers_set(db: Session) -> set[str]:
+    """Return the watchlist as a set of uppercase tickers — used by the
+    /orders/confirm whitelist gate and the position-change classifier.
+    Hot path; keep it cheap."""
+    return {
+        row.ticker.upper()
+        for row in db.query(WatchlistTicker.ticker).all()
+    }
+
+
+def add_watchlist_ticker(
+    db: Session, ticker: str, notes: Optional[str] = None
+) -> WatchlistTicker:
+    """
+    Add a ticker to the watchlist. Idempotent: if the ticker already
+    exists, update the notes field (if provided) and return the existing
+    row. Uppercases the ticker on the way in.
+    """
+    ticker = (ticker or "").strip().upper()
+    existing = (
+        db.query(WatchlistTicker)
+        .filter(WatchlistTicker.ticker == ticker)
+        .first()
+    )
+    if existing is not None:
+        if notes is not None:
+            existing.notes = notes
+            db.commit()
+            db.refresh(existing)
+        return existing
+    row = WatchlistTicker(ticker=ticker, notes=notes)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def remove_watchlist_ticker(db: Session, ticker: str) -> bool:
+    """Remove a ticker by symbol. Returns True if a row was deleted."""
+    ticker = (ticker or "").strip().upper()
+    row = (
+        db.query(WatchlistTicker)
+        .filter(WatchlistTicker.ticker == ticker)
+        .first()
+    )
+    if row is None:
+        return False
+    db.delete(row)
+    db.commit()
+    return True
+
+
+def seed_watchlist_if_empty(db: Session, tickers: list[str]) -> int:
+    """
+    If the watchlist table is empty, seed it from the given list.
+    Used by the FastAPI lifespan to migrate DEFAULT_WATCHLIST from .env
+    into the DB on first startup without clobbering anything the user
+    has already added.
+    """
+    if db.query(WatchlistTicker.ticker).first() is not None:
+        return 0
+    added = 0
+    for ticker in tickers:
+        t = (ticker or "").strip().upper()
+        if not t:
+            continue
+        db.add(WatchlistTicker(ticker=t, notes=None))
+        added += 1
+    if added:
+        db.commit()
+    return added
 
 
 # -- Trade journal entries -----------------------------------------------------

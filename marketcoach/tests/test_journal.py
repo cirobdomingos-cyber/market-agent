@@ -47,6 +47,16 @@ _TestSession = sessionmaker(bind=_engine)
 @pytest.fixture(autouse=True)
 def _setup_db():
     Base.metadata.create_all(bind=_engine)
+    # Seed a default watchlist so trades on common tickers pass the
+    # whitelist gate without each test needing to set it up.
+    from backend.db.models import WatchlistTicker
+    session = _TestSession()
+    try:
+        for t in ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "META", "SPY", "QQQ"]:
+            session.add(WatchlistTicker(ticker=t))
+        session.commit()
+    finally:
+        session.close()
     yield
     Base.metadata.drop_all(bind=_engine)
 

@@ -73,6 +73,21 @@ async def lifespan(app: FastAPI):
     logger.info("MarketCoach starting up")
     init_db()
 
+    # Seed the watchlist from DEFAULT_WATCHLIST on first startup. This
+    # migrates the old env-var-based watchlist into the database so the
+    # user can add/remove tickers from the UI without editing .env and
+    # restarting. If the watchlist table already has rows, seed is a
+    # no-op — the user's existing picks are preserved.
+    from backend.db import SessionLocal
+    _seed_db = SessionLocal()
+    try:
+        from backend.db import crud as _crud
+        _seeded = _crud.seed_watchlist_if_empty(_seed_db, settings.watchlist)
+        if _seeded:
+            logger.info("Seeded %d tickers into watchlist from env", _seeded)
+    finally:
+        _seed_db.close()
+
     # Initialize the broker singleton. Provider is chosen by settings.broker_provider
     # ("alpaca" | "ibkr"). Trading mode is gated by the same dual switch regardless
     # of provider: alpaca_paper=False is not enough — the confirmation phrase must
@@ -175,6 +190,11 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
     message: str = Field(min_length=1, max_length=4000)
+
+
+class WatchlistAddRequest(BaseModel):
+    ticker: str = Field(min_length=1, max_length=5, pattern=r"^[A-Za-z]{1,5}$")
+    notes: Optional[str] = Field(default=None, max_length=500)
 
 
 class OrderConfirmRequest(BaseModel):
@@ -611,6 +631,56 @@ def get_portfolio(_auth: str = Depends(require_auth)):
     }
 
 
+@app.get("/watchlist")
+def get_watchlist(
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Return all tickers currently on the watchlist, alphabetically."""
+    rows = crud.list_watchlist_tickers(db)
+    return [
+        {
+            "ticker": r.ticker,
+            "notes": r.notes,
+            "added_at": r.added_at.isoformat() if r.added_at else None,
+        }
+        for r in rows
+    ]
+
+
+@app.post("/watchlist")
+def add_watchlist_ticker_route(
+    request: WatchlistAddRequest,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """
+    Add a ticker to the watchlist. Idempotent — re-adding an existing
+    ticker just updates its notes (if provided). Ticker is uppercased.
+    """
+    row = crud.add_watchlist_ticker(
+        db, ticker=request.ticker, notes=request.notes
+    )
+    return {
+        "ticker": row.ticker,
+        "notes": row.notes,
+        "added_at": row.added_at.isoformat() if row.added_at else None,
+    }
+
+
+@app.delete("/watchlist/{ticker}")
+def delete_watchlist_ticker_route(
+    ticker: str,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Remove a ticker from the watchlist. 404 if not found."""
+    ok = crud.remove_watchlist_ticker(db, ticker)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Ticker {ticker} not on watchlist")
+    return {"deleted": ticker.upper()}
+
+
 @app.get("/portfolio/orders")
 def get_order_history(
     limit: int = Query(default=20, ge=1, le=100),
@@ -738,7 +808,7 @@ def confirm_order(
     whitelist.update(
         (t.ticker or "").upper() for t in crud.get_open_theses(db, limit=100)
     )
-    whitelist.update(t.upper() for t in settings.watchlist)
+    whitelist.update(crud.get_watchlist_tickers_set(db))
 
     if request.ticker not in whitelist:
         return _persist_rejection(
@@ -1121,7 +1191,14 @@ def run_backtest_endpoint(
 
     start = date.fromisoformat(request.start_date)
     end = date.fromisoformat(request.end_date) if request.end_date else date.today() - timedelta(days=1)
-    watchlist = [t.strip().upper() for t in (request.watchlist or settings.watchlist)]
+    # Backtest watchlist: request body override first, DB watchlist second,
+    # env default last. The last fallback should never trigger in practice
+    # because the lifespan seeds the DB on first startup.
+    db_watchlist = [row.ticker for row in crud.list_watchlist_tickers(db)]
+    watchlist = [
+        t.strip().upper()
+        for t in (request.watchlist or db_watchlist or settings.watchlist)
+    ]
 
     if start >= end:
         raise HTTPException(status_code=400, detail="start_date must be before end_date")
@@ -1213,6 +1290,7 @@ _FOMC_DATES_2026 = [
 def get_events(
     year: int = Query(default=None, ge=2020, le=2030),
     month: int = Query(default=None, ge=1, le=12),
+    db: Session = Depends(get_db),
 ):
     """
     Return market events for a given month: upcoming earnings dates for all
@@ -1248,7 +1326,9 @@ def get_events(
             })
 
     # -- Earnings dates from yfinance for each watchlist ticker --
-    for ticker in settings.watchlist:
+    # Read from DB (the live watchlist); fall back to env default if empty.
+    _watchlist = [row.ticker for row in crud.list_watchlist_tickers(db)] or settings.watchlist
+    for ticker in _watchlist:
         try:
             t = yf.Ticker(ticker)
             earn_df = t.earnings_dates

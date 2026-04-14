@@ -153,6 +153,31 @@ class AutoRule(Base):
     created_at = Column(DateTime, default=_now_utc)
 
 
+class WatchlistTicker(Base):
+    """
+    A ticker on the user's watchlist.
+
+    The watchlist gates which tickers the /orders/confirm endpoint will
+    actually submit (positions ∪ open theses ∪ watchlist). It's also the
+    seed list for the news intelligence pipeline — every 4h the news
+    agent fetches news for these tickers.
+
+    Historically the watchlist lived in DEFAULT_WATCHLIST in .env as a
+    comma-separated string. That meant adding a new ticker required
+    editing .env and restarting the backend, which hit us the first time
+    the user wanted to trade GLD. Now it's a proper table — env stays as
+    the initial seed for first-run installs, but all runtime reads go
+    through this model so the user can add/remove from the UI without
+    restarting anything.
+    """
+
+    __tablename__ = "watchlist"
+
+    ticker = Column(String, primary_key=True)  # uppercase, unique
+    notes = Column(Text, nullable=True)         # optional "why I'm watching"
+    added_at = Column(DateTime, default=_now_utc)
+
+
 class TradeJournalEntry(Base):
     """
     A user-owned trade journal entry. Captures the full lifecycle of one

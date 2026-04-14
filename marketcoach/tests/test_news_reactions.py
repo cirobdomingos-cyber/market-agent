@@ -142,7 +142,6 @@ class TestReactionFilter:
             patch.object(settings, "news_reaction_min_confidence", 0.8),
             patch.object(settings, "news_reactions_per_run_max", 5),
             patch.object(settings, "news_reaction_dedupe_hours", 6),
-            patch.object(settings, "default_watchlist", "NVDA,AAPL,MSFT,SPY"),
         ]
         for p in self._patches:
             p.start()
@@ -150,6 +149,16 @@ class TestReactionFilter:
     def teardown_method(self):
         for p in self._patches:
             p.stop()
+
+    @pytest.fixture(autouse=True)
+    def _seed_watchlist_for_tests(self, db):
+        """Seed a deterministic watchlist in the DB for every test in this
+        class. Migrated from monkeypatching settings.default_watchlist —
+        the runtime now reads the watchlist from the DB, not env."""
+        from backend.db.models import WatchlistTicker
+        for t in ["NVDA", "AAPL", "MSFT", "SPY"]:
+            db.add(WatchlistTicker(ticker=t))
+        db.commit()
 
     def _signal(self, ticker, confidence=0.9, sentiment="bullish", headline="news"):
         return {

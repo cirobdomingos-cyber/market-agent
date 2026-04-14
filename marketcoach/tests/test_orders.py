@@ -32,9 +32,30 @@ _engine = create_engine(
 _TestSession = sessionmaker(bind=_engine)
 
 
+_DEFAULT_TEST_WATCHLIST = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "META", "SPY", "QQQ"]
+
+
+def _seed_watchlist(session, tickers):
+    """Clear + reseed the watchlist for a test. The test DB is fresh per
+    test, so this is the fastest way to set a specific whitelist."""
+    from backend.db.models import WatchlistTicker
+    session.query(WatchlistTicker).delete()
+    for t in tickers:
+        session.add(WatchlistTicker(ticker=t.upper()))
+    session.commit()
+
+
 @pytest.fixture(autouse=True)
 def _setup_db():
     Base.metadata.create_all(bind=_engine)
+    # Seed the production-default watchlist before every test so NVDA/etc.
+    # pass the whitelist gate by default. Tests that need a custom watchlist
+    # override it with _seed_watchlist(db, [...]).
+    session = _TestSession()
+    try:
+        _seed_watchlist(session, _DEFAULT_TEST_WATCHLIST)
+    finally:
+        session.close()
     yield
     Base.metadata.drop_all(bind=_engine)
 
@@ -231,8 +252,8 @@ class TestDailyCap:
 # ── Whitelist gate ─────────────────────────────────────────────────────────
 
 class TestWhitelistGate:
-    def test_unrelated_ticker_rejected(self, client, mock_alpaca, monkeypatch):
-        monkeypatch.setattr(settings, "default_watchlist", "AAPL,MSFT")
+    def test_unrelated_ticker_rejected(self, client, db, mock_alpaca):
+        _seed_watchlist(db, ["AAPL", "MSFT"])
         with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post(
                 "/orders/confirm",
@@ -243,8 +264,8 @@ class TestWhitelistGate:
         assert body["status"] == "rejected"
         assert "whitelist" in body["rejection_reason"].lower()
 
-    def test_watchlist_ticker_passes(self, client, mock_alpaca, monkeypatch):
-        monkeypatch.setattr(settings, "default_watchlist", "NVDA,AAPL")
+    def test_watchlist_ticker_passes(self, client, db, mock_alpaca):
+        _seed_watchlist(db, ["NVDA", "AAPL"])
         with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 200
@@ -252,9 +273,9 @@ class TestWhitelistGate:
         assert body["status"] in ("filled", "accepted")
 
     def test_position_ticker_passes_even_without_watchlist(
-        self, client, mock_alpaca, monkeypatch
+        self, client, db, mock_alpaca
     ):
-        monkeypatch.setattr(settings, "default_watchlist", "AAPL")
+        _seed_watchlist(db, ["AAPL"])  # NVDA not on watchlist
         mock_alpaca.get_positions.return_value = [{"ticker": "NVDA"}]
         with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post("/orders/confirm", json=_valid_request())
@@ -301,9 +322,9 @@ class TestPersistence:
         assert orders[0].advisor_session_id == "advisor-test"
 
     def test_rejected_order_persisted_with_reason(
-        self, client, db, mock_alpaca, monkeypatch
+        self, client, db, mock_alpaca
     ):
-        monkeypatch.setattr(settings, "default_watchlist", "AAPL")
+        _seed_watchlist(db, ["AAPL"])  # ZZZZ will be off-whitelist
         with patch("backend.main.get_broker", return_value=mock_alpaca):
             client.post("/orders/confirm", json=_valid_request(ticker="ZZZZ"))
         orders = crud.list_executed_orders(db)
