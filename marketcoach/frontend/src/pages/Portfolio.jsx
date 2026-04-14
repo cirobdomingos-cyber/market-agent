@@ -143,24 +143,38 @@ export default function Portfolio() {
                 </tr>
               </thead>
               <tbody>
-                {positions.map((p, i) => (
-                  <tr key={i} className="border-t border-gray-800">
-                    <td className="px-4 py-2 font-mono font-bold">{p.ticker}</td>
-                    <td className="px-4 py-2 text-right">{p.qty}</td>
-                    <td className="px-4 py-2 text-right">${Number(p.avg_entry).toFixed(2)}</td>
-                    <td className="px-4 py-2 text-right">${Number(p.current_price).toFixed(2)}</td>
-                    <td className={`px-4 py-2 text-right font-medium ${
-                      p.unrealised_pnl >= 0 ? 'text-green-400' : 'text-red-400'
-                    }`}>
-                      ${Number(p.unrealised_pnl).toFixed(2)}
-                    </td>
-                    <td className={`px-4 py-2 text-right ${
-                      p.unrealised_pnl_pct >= 0 ? 'text-green-400' : 'text-red-400'
-                    }`}>
-                      {Number(p.unrealised_pnl_pct).toFixed(1)}%
-                    </td>
-                  </tr>
-                ))}
+                {positions.map((p, i) => {
+                  // Show a dash instead of $0.00 when the broker hasn't
+                  // given us a current_price yet (e.g. yfinance lookup
+                  // failed, or IBKR returned a tombstone row with qty=0).
+                  const hasPrice = p.current_price !== null && p.current_price !== undefined
+                  const hasPnl = p.unrealised_pnl !== null && p.unrealised_pnl !== undefined
+                  const isPositive = (p.unrealised_pnl ?? 0) >= 0
+                  return (
+                    <tr key={i} className="border-t border-gray-800">
+                      <td className="px-4 py-2 font-mono font-bold">{p.ticker}</td>
+                      <td className="px-4 py-2 text-right">{p.qty}</td>
+                      <td className="px-4 py-2 text-right">${Number(p.avg_entry).toFixed(2)}</td>
+                      <td className="px-4 py-2 text-right text-gray-300">
+                        {hasPrice ? `$${Number(p.current_price).toFixed(2)}` : '—'}
+                      </td>
+                      <td className={`px-4 py-2 text-right font-medium ${
+                        !hasPnl ? 'text-gray-500' : isPositive ? 'text-green-400' : 'text-red-400'
+                      }`}>
+                        {hasPnl
+                          ? `${isPositive ? '+' : ''}$${Number(p.unrealised_pnl).toFixed(2)}`
+                          : '—'}
+                      </td>
+                      <td className={`px-4 py-2 text-right ${
+                        !hasPnl ? 'text-gray-500' : isPositive ? 'text-green-400' : 'text-red-400'
+                      }`}>
+                        {hasPnl
+                          ? `${isPositive ? '+' : ''}${Number(p.unrealised_pnl_pct).toFixed(2)}%`
+                          : '—'}
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>

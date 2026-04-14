@@ -265,22 +265,48 @@ class IBKRBroker(BrokerClient):
 
         try:
             positions = _run_on_broker_loop(_do(), timeout=10.0)
+            # Enrich each position with a current price from yfinance.
+            # IBKR's built-in market data would require a real-time
+            # subscription (~$1.50/mo) AND a slow cross-loop snapshot call;
+            # yfinance is free, returns real-time-ish last trade, and we
+            # already depend on it via the market_data tool. Single lookup
+            # per position — cheap for a handful, still fine for dozens.
+            from backend.tools.market_data import execute_market_data
             results = []
             for p in positions:
                 qty = float(p.position)
                 avg_entry = float(p.avgCost)
-                # Current price requires a market-data subscription. Fetching
-                # a snapshot across the loop boundary is slow and noisy on
-                # paper accounts without a real-time subscription — skip it
-                # here and let the market_data tool (yfinance) provide prices
-                # when the frontend needs them.
+                ticker = p.contract.symbol
+
+                current_price = None
+                if qty != 0:  # don't bother for tombstone rows
+                    try:
+                        quote = execute_market_data(action="quote", ticker=ticker)
+                        if isinstance(quote, dict) and quote.get("price"):
+                            current_price = float(quote["price"])
+                    except Exception as exc:
+                        logger.debug(
+                            "Current price lookup failed for %s: %s",
+                            ticker, exc,
+                        )
+
+                # Derive P&L only if we have both prices
+                if current_price is not None and avg_entry > 0:
+                    unrealised_pnl = (current_price - avg_entry) * qty
+                    unrealised_pnl_pct = (
+                        ((current_price - avg_entry) / avg_entry) * 100
+                    )
+                else:
+                    unrealised_pnl = None
+                    unrealised_pnl_pct = None
+
                 results.append({
-                    "ticker": p.contract.symbol,
+                    "ticker": ticker,
                     "qty": qty,
                     "avg_entry": avg_entry,
-                    "current_price": None,
-                    "unrealised_pnl": None,
-                    "unrealised_pnl_pct": None,
+                    "current_price": current_price,
+                    "unrealised_pnl": unrealised_pnl,
+                    "unrealised_pnl_pct": unrealised_pnl_pct,
                 })
             return results
         except Exception as exc:
