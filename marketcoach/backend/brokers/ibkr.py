@@ -35,12 +35,56 @@ The ib_insync import is deferred until first use so the package isn't
 required at startup — users who stay on Alpaca don't need to install it.
 """
 
+import asyncio
 import logging
+import threading
 from typing import Optional
 
 from backend.brokers.base import BrokerClient, OrderResult
 
 logger = logging.getLogger(__name__)
+
+
+# ── ib_insync import at module load time ────────────────────────────────────
+#
+# The eventkit library (ib_insync's dependency) calls asyncio.get_event_loop()
+# at import time to cache a "main" loop. That call works on the main thread
+# (where FastAPI's lifespan runs) but fails with "no current event loop in
+# thread" when triggered lazily from a FastAPI worker thread.
+#
+# Fix: import ib_insync once at module load time. This module is imported
+# during init_broker("ibkr", ...) which runs inside the async lifespan on
+# the main thread, so get_event_loop() finds a real loop.
+#
+# We still tolerate ib_insync being missing (ImportError → set sentinel)
+# so that tests and the Alpaca-only path don't need the package installed.
+
+try:
+    from ib_insync import IB as _IB
+    from ib_insync import Stock as _Stock
+    from ib_insync import MarketOrder as _MarketOrder
+    _IBKR_AVAILABLE = True
+except ImportError:  # pragma: no cover — graceful degradation
+    _IB = None
+    _Stock = None
+    _MarketOrder = None
+    _IBKR_AVAILABLE = False
+    logger.debug("ib_insync not installed — IBKR broker will refuse connections")
+
+
+def _ensure_thread_event_loop() -> None:
+    """
+    FastAPI sync endpoints run in worker threads with no default event loop.
+    ib_insync's sync shims (ib.connect, ib.placeOrder, etc.) need a loop in
+    the current thread to run the underlying async operations on. Create a
+    fresh loop for the thread if there isn't one — safe no-op when there is.
+    """
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        # "There is no current event loop in thread '...'"
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
 
 class IBKRBroker(BrokerClient):
@@ -73,17 +117,19 @@ class IBKRBroker(BrokerClient):
         if self._ib is not None and self._ib.isConnected():
             return True
 
-        try:
-            from ib_insync import IB  # lazy import — package is optional
-        except ImportError:
+        if not _IBKR_AVAILABLE:
             logger.warning(
                 "ib_insync not installed — install with `pip install ib_insync` "
                 "and start IB Gateway to enable IBKR broker"
             )
             return False
 
+        # FastAPI sync endpoints run in worker threads with no default event
+        # loop. ib_insync needs one to run its async internals on.
+        _ensure_thread_event_loop()
+
         try:
-            ib = IB()
+            ib = _IB()
             ib.connect(self.host, self.port, clientId=self.client_id, timeout=5)
             self._ib = ib
             logger.info(
@@ -249,12 +295,10 @@ class IBKRBroker(BrokerClient):
             )
 
         try:
-            from ib_insync import Stock, MarketOrder
-
-            contract = Stock(ticker, "SMART", "USD")
+            contract = _Stock(ticker, "SMART", "USD")
             self._ib.qualifyContracts(contract)
 
-            order = MarketOrder(
+            order = _MarketOrder(
                 action="BUY" if side == "buy" else "SELL",
                 totalQuantity=qty,
             )
@@ -301,8 +345,6 @@ class IBKRBroker(BrokerClient):
             return {"error": "IBKR not configured"}
 
         try:
-            from ib_insync import Stock, MarketOrder
-
             # Find the open position for this ticker
             target = None
             for p in self._ib.positions():
@@ -315,9 +357,9 @@ class IBKRBroker(BrokerClient):
             qty = abs(float(target.position))
             side = "SELL" if target.position > 0 else "BUY"
 
-            contract = Stock(ticker, "SMART", "USD")
+            contract = _Stock(ticker, "SMART", "USD")
             self._ib.qualifyContracts(contract)
-            order = MarketOrder(action=side, totalQuantity=qty)
+            order = _MarketOrder(action=side, totalQuantity=qty)
             trade = self._ib.placeOrder(contract, order)
             self._ib.sleep(1)
 
