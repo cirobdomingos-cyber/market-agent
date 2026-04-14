@@ -183,6 +183,93 @@ class AlpacaBroker(BrokerClient):
                 is_paper=self.paper,
             )
 
+    def place_bracket_order(
+        self,
+        ticker: str,
+        qty: float,
+        side: str,
+        limit_price: float,
+        stop_loss_price: float,
+        take_profit_price: float,
+        paper_only: bool = True,
+    ) -> OrderResult:
+        # v1: bracket entries are long-only. Shorts would need reversed
+        # stop/target semantics and we'd rather refuse than ship a silent bug.
+        if side != "buy":
+            raise ValueError("Bracket orders only support BUY (long entries) in v1")
+        if not paper_only and not self.paper:
+            raise ValueError(
+                "Live trading requires explicit user confirmation. "
+                "Set paper_only=True or use the paper account."
+            )
+        if self._client is None:
+            return OrderResult(
+                order_id="error",
+                ticker=ticker,
+                qty=qty,
+                side=side,
+                status="error_disconnected",
+                is_paper=paper_only,
+            )
+
+        try:
+            from alpaca.trading.requests import (
+                LimitOrderRequest,
+                StopLossRequest,
+                TakeProfitRequest,
+            )
+            from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+
+            # GTC (not DAY) so the attached exit legs persist across overnight
+            # holds — the whole point of a bracket is that you don't have to
+            # babysit it. Day-TIF brackets die at close and leave the position
+            # naked the next morning.
+            request = LimitOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.GTC,
+                limit_price=limit_price,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=take_profit_price),
+                stop_loss=StopLossRequest(stop_price=stop_loss_price),
+            )
+            order = self._client.submit_order(request)
+
+            logger.info(
+                "Alpaca bracket submitted: BUY %s x%.2f @ $%.2f "
+                "(stop $%.2f, target $%.2f) → %s (paper=%s)",
+                ticker, qty, limit_price, stop_loss_price, take_profit_price,
+                order.status.value, self.paper,
+            )
+
+            return OrderResult(
+                order_id=str(order.id),
+                ticker=order.symbol,
+                qty=float(order.qty) if order.qty else qty,
+                side=order.side.value,
+                status=order.status.value,
+                is_paper=self.paper,
+                fill_price=(
+                    float(order.filled_avg_price)
+                    if order.filled_avg_price
+                    else None
+                ),
+            )
+        except ValueError:
+            # Paper-mode guard — propagate up, don't eat it into an error row.
+            raise
+        except Exception as exc:
+            logger.error("Alpaca place_bracket_order failed: %s", exc)
+            return OrderResult(
+                order_id="error",
+                ticker=ticker,
+                qty=qty,
+                side=side,
+                status=f"error: {exc}",
+                is_paper=self.paper,
+            )
+
     def close_position(self, ticker: str) -> dict:
         if self._client is None:
             return {"error": "Alpaca not configured"}

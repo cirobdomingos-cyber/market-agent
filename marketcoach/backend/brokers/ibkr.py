@@ -65,11 +65,15 @@ try:
     from ib_insync import IB as _IB
     from ib_insync import Stock as _Stock
     from ib_insync import MarketOrder as _MarketOrder
+    from ib_insync import LimitOrder as _LimitOrder
+    from ib_insync import StopOrder as _StopOrder
     _IBKR_AVAILABLE = True
 except ImportError:  # pragma: no cover — graceful degradation
     _IB = None
     _Stock = None
     _MarketOrder = None
+    _LimitOrder = None
+    _StopOrder = None
     _IBKR_AVAILABLE = False
     logger.debug("ib_insync not installed — IBKR broker will refuse connections")
 
@@ -427,6 +431,100 @@ class IBKRBroker(BrokerClient):
             )
         except Exception as exc:
             logger.error("IBKR place_order failed: %s", exc)
+            return OrderResult(
+                order_id="error",
+                ticker=ticker,
+                qty=qty,
+                side=side,
+                status=f"error: {exc}",
+                is_paper=self.paper,
+            )
+
+    def place_bracket_order(
+        self,
+        ticker: str,
+        qty: float,
+        side: str,
+        limit_price: float,
+        stop_loss_price: float,
+        take_profit_price: float,
+        paper_only: bool = True,
+    ) -> OrderResult:
+        """
+        IBKR brackets use ib_insync's helper which returns [parent, takeProfit,
+        stopLoss]. The three orders share a parentId so TWS binds them as an
+        OCO group automatically — when one exit fills, the other cancels.
+
+        We submit all three with placeOrder() but only return the PARENT's
+        OrderResult. The exit legs live at the broker and don't appear in
+        our executed_orders table until they fill (at which point the
+        position poll + journal flow handles the close).
+        """
+        if side != "buy":
+            raise ValueError("Bracket orders only support BUY (long entries) in v1")
+        if not paper_only and not self.paper:
+            raise ValueError(
+                "Live trading requires explicit user confirmation. "
+                "Use the paper IBKR account or set paper_only=True."
+            )
+        if not self._ensure_connected():
+            return OrderResult(
+                order_id="error",
+                ticker=ticker,
+                qty=qty,
+                side=side,
+                status="error_disconnected",
+                is_paper=self.paper,
+            )
+
+        async def _do():
+            contract = _Stock(ticker, "SMART", "USD")
+            await self._ib.qualifyContractsAsync(contract)
+            # ib_insync's bracketOrder helper wires the parentId + tif=GTC
+            # for us. It returns [parent, takeProfit, stopLoss] — submit all
+            # three to establish the OCO group at the broker.
+            bracket = self._ib.bracketOrder(
+                action="BUY",
+                quantity=qty,
+                limitPrice=limit_price,
+                takeProfitPrice=take_profit_price,
+                stopLossPrice=stop_loss_price,
+            )
+            trades = [self._ib.placeOrder(contract, o) for o in bracket]
+            await asyncio.sleep(2.0)
+            return trades
+
+        try:
+            trades = _run_on_broker_loop(_do(), timeout=15.0)
+            parent = trades[0]
+
+            status = parent.orderStatus.status if parent.orderStatus else "Submitted"
+            avg_fill = (
+                float(parent.orderStatus.avgFillPrice)
+                if parent.orderStatus and parent.orderStatus.avgFillPrice
+                else None
+            )
+
+            logger.info(
+                "IBKR bracket submitted: BUY %s x%.2f @ $%.2f "
+                "(stop $%.2f, target $%.2f) → %s (paper=%s, fill=%s)",
+                ticker, qty, limit_price, stop_loss_price, take_profit_price,
+                status, self.paper, avg_fill,
+            )
+
+            return OrderResult(
+                order_id=str(parent.order.permId or parent.order.orderId),
+                ticker=ticker,
+                qty=qty,
+                side=side,
+                status=status.lower(),
+                is_paper=self.paper,
+                fill_price=avg_fill,
+            )
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.error("IBKR place_bracket_order failed: %s", exc)
             return OrderResult(
                 order_id="error",
                 ticker=ticker,

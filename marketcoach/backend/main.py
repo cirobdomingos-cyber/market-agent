@@ -215,6 +215,12 @@ class OrderConfirmRequest(BaseModel):
     qty: float = Field(gt=0, le=10_000)
     order_type: str = Field(pattern=r"^(market|limit)$")
     limit_price: Optional[float] = Field(default=None, gt=0)
+    # Bracket fields — optional. When BOTH are set, /orders/confirm routes
+    # the request to place_bracket_order so the exits are wired at the
+    # broker instead of left as manual to-dos. See the bracket gate in the
+    # endpoint for the full set of rules (buy-only, limit-only, level order).
+    stop_loss: Optional[float] = Field(default=None, gt=0)
+    target_1: Optional[float] = Field(default=None, gt=0)
     rationale: Optional[str] = Field(default=None, max_length=500)
     advisor_session_id: Optional[str] = Field(default=None, max_length=64)
     # Live mode safety: this field MUST be present and True when the system
@@ -816,7 +822,10 @@ def _serialise_executed_order(o) -> dict:
         "side": o.side,
         "qty": o.qty,
         "order_type": o.order_type,
+        "order_class": o.order_class or "simple",
         "limit_price": o.limit_price,
+        "stop_loss_price": o.stop_loss_price,
+        "take_profit_price": o.take_profit_price,
         "fill_price": o.fill_price,
         "status": o.status,
         "rejection_reason": o.rejection_reason,
@@ -869,6 +878,47 @@ def confirm_order(
             status_code=422,
             detail="limit_price must be null when order_type is 'market'",
         )
+
+    # Bracket gate — BOTH stop_loss AND target_1 must be set (or neither).
+    # A one-sided bracket is almost always a UI or advisor bug, and silently
+    # treating it as a simple order would mask the missing leg. Refuse
+    # explicitly and let the caller fix it.
+    is_bracket = request.stop_loss is not None and request.target_1 is not None
+    if (request.stop_loss is None) != (request.target_1 is None):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Bracket orders require BOTH stop_loss and target_1. "
+                "Set both, or neither."
+            ),
+        )
+    if is_bracket:
+        # v1 constraints: long entries only, limit parent only, and the
+        # levels have to be internally consistent. Each of these could be
+        # relaxed later but only after the broker impls catch up.
+        if request.side != "buy":
+            raise HTTPException(
+                status_code=422,
+                detail="Bracket orders only support side='buy' in v1 (long entries).",
+            )
+        if request.order_type != "limit":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Bracket orders require order_type='limit' so the parent "
+                    "has a defined entry price. Use a limit entry."
+                ),
+            )
+        if not (request.stop_loss < request.limit_price < request.target_1):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Bracket levels inconsistent: need "
+                    f"stop_loss ({request.stop_loss}) < "
+                    f"limit_price ({request.limit_price}) < "
+                    f"target_1 ({request.target_1})."
+                ),
+            )
 
     # Gate 2 — live-mode confirmation
     if settings.is_live_mode and not request.confirm_live_capital:
@@ -980,24 +1030,40 @@ def confirm_order(
                 f"(${max_notional:,.0f}). Reduce qty or raise PORTFOLIO_MAX_PCT.",
             )
 
-    # All gates passed — submit to Alpaca
+    # All gates passed — submit to the broker. Bracket path goes through
+    # place_bracket_order which returns the parent leg; the attached
+    # take-profit and stop-loss legs live at the broker from here on.
     from datetime import datetime, timezone
     try:
-        result = client.place_order(
-            ticker=request.ticker,
-            qty=request.qty,
-            side=request.side,
-            paper_only=not settings.is_live_mode,
-        )
+        if is_bracket:
+            result = client.place_bracket_order(
+                ticker=request.ticker,
+                qty=request.qty,
+                side=request.side,
+                limit_price=request.limit_price,
+                stop_loss_price=request.stop_loss,
+                take_profit_price=request.target_1,
+                paper_only=not settings.is_live_mode,
+            )
+        else:
+            result = client.place_order(
+                ticker=request.ticker,
+                qty=request.qty,
+                side=request.side,
+                paper_only=not settings.is_live_mode,
+            )
     except Exception as exc:
-        logger.exception("Alpaca place_order failed for %s", request.ticker)
+        logger.exception("Broker order placement failed for %s", request.ticker)
         failed = crud.create_executed_order(
             db,
             ticker=request.ticker,
             side=request.side,
             qty=request.qty,
             order_type=request.order_type,
+            order_class="bracket" if is_bracket else "simple",
             limit_price=request.limit_price,
+            stop_loss_price=request.stop_loss,
+            take_profit_price=request.target_1,
             status="failed",
             rejection_reason=str(exc),
             is_paper=not settings.is_live_mode,
@@ -1013,7 +1079,10 @@ def confirm_order(
         side=result.side,
         qty=result.qty,
         order_type=request.order_type,
+        order_class="bracket" if is_bracket else "simple",
         limit_price=request.limit_price,
+        stop_loss_price=request.stop_loss,
+        take_profit_price=request.target_1,
         fill_price=result.fill_price,
         status="filled" if result.fill_price else "accepted",
         is_paper=result.is_paper,

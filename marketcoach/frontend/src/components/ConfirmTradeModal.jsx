@@ -29,6 +29,17 @@ export default function ConfirmTradeModal({
 
   const thesisValid = userThesis.trim().length >= 10
 
+  // Detect whether this proposal qualifies for an auto-executed bracket
+  // order. Backend enforces identical rules server-side; this is just so
+  // the UI can show the right badge and forward the fields.
+  const isBracket =
+    proposal.side === 'buy' &&
+    proposal.order_type === 'limit' &&
+    typeof proposal.stop_loss === 'number' &&
+    typeof proposal.target_1 === 'number' &&
+    proposal.stop_loss < proposal.limit_price &&
+    proposal.limit_price < proposal.target_1
+
   const submit = async () => {
     setSubmitting(true)
     setError(null)
@@ -39,6 +50,11 @@ export default function ConfirmTradeModal({
         qty: proposal.qty,
         order_type: proposal.order_type,
         limit_price: proposal.order_type === 'limit' ? proposal.limit_price : null,
+        // Forward bracket levels only when they form a valid bracket.
+        // Sending a single side would trip the backend's "both or neither"
+        // gate and 422 the request.
+        stop_loss: isBracket ? proposal.stop_loss : null,
+        target_1: isBracket ? proposal.target_1 : null,
         rationale: proposal.rationale || null,
         advisor_session_id: advisorSessionId || null,
         confirm_live_capital: isLive ? confirmLive : false,
@@ -113,29 +129,71 @@ export default function ConfirmTradeModal({
           )}
         </div>
 
-        {(proposal.stop_loss || proposal.target_1 || proposal.target_2) && (
-          <div className="text-xs text-gray-400 mb-4">
-            <p className="font-semibold text-gray-300 mb-1">
-              Manual exits to set after fill:
-            </p>
-            <ul className="space-y-0.5 list-disc list-inside">
-              {proposal.stop_loss && (
-                <li>
-                  Stop loss: <span className="text-red-400 font-mono">{fmtMoney(proposal.stop_loss)}</span>
-                </li>
-              )}
-              {proposal.target_1 && (
-                <li>
-                  Target 1: <span className="text-emerald-400 font-mono">{fmtMoney(proposal.target_1)}</span>
-                </li>
-              )}
+        {isBracket ? (
+          <div className="text-xs mb-4 p-3 bg-indigo-950/30 border border-indigo-800/60 rounded">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="px-1.5 py-0.5 text-[10px] font-bold tracking-wide bg-indigo-600 text-white rounded">
+                AUTO BRACKET
+              </span>
+              <span className="text-indigo-200 font-semibold">
+                Exits will execute automatically
+              </span>
+            </div>
+            <ul className="space-y-0.5 list-disc list-inside text-gray-300">
+              <li>
+                Parent: BUY limit at{' '}
+                <span className="font-mono text-white">{fmtMoney(proposal.limit_price)}</span>
+              </li>
+              <li>
+                Take profit at{' '}
+                <span className="text-emerald-400 font-mono">{fmtMoney(proposal.target_1)}</span>
+              </li>
+              <li>
+                Stop loss at{' '}
+                <span className="text-red-400 font-mono">{fmtMoney(proposal.stop_loss)}</span>
+              </li>
               {proposal.target_2 && (
-                <li>
-                  Target 2: <span className="text-emerald-400 font-mono">{fmtMoney(proposal.target_2)}</span>
+                <li className="text-gray-500">
+                  Second target{' '}
+                  <span className="font-mono">{fmtMoney(proposal.target_2)}</span>{' '}
+                  — manual (move stop here if first target fills)
                 </li>
               )}
             </ul>
+            <p className="text-[10px] text-gray-500 mt-2 leading-relaxed">
+              The broker binds these as an OCO group: when one exit fills the
+              other cancels automatically. GTC — persists overnight.
+            </p>
           </div>
+        ) : (
+          (proposal.stop_loss || proposal.target_1 || proposal.target_2) && (
+            <div className="text-xs text-gray-400 mb-4">
+              <p className="font-semibold text-gray-300 mb-1">
+                Manual exits to set after fill:
+              </p>
+              <ul className="space-y-0.5 list-disc list-inside">
+                {proposal.stop_loss && (
+                  <li>
+                    Stop loss: <span className="text-red-400 font-mono">{fmtMoney(proposal.stop_loss)}</span>
+                  </li>
+                )}
+                {proposal.target_1 && (
+                  <li>
+                    Target 1: <span className="text-emerald-400 font-mono">{fmtMoney(proposal.target_1)}</span>
+                  </li>
+                )}
+                {proposal.target_2 && (
+                  <li>
+                    Target 2: <span className="text-emerald-400 font-mono">{fmtMoney(proposal.target_2)}</span>
+                  </li>
+                )}
+              </ul>
+              <p className="text-[10px] text-gray-600 mt-1 italic">
+                Bracket skipped — needs a BUY limit with stop_loss &lt;
+                limit_price &lt; target_1.
+              </p>
+            </div>
+          )
         )}
 
         {proposal.rationale && (

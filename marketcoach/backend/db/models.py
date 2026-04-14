@@ -356,7 +356,16 @@ class ExecutedOrder(Base):
     side = Column(String, nullable=False)              # buy | sell
     qty = Column(Float, nullable=False)
     order_type = Column(String, nullable=False)        # market | limit
+    # order_class distinguishes plain single-leg orders from bracket entries.
+    # Nullable because historical rows predate the column — treat null as
+    # "simple" when reading.
+    order_class = Column(String, nullable=True)         # simple | bracket | null (legacy=simple)
     limit_price = Column(Float, nullable=True)
+    # Bracket-only: the attached stop-loss and take-profit levels submitted
+    # with the parent order. Stored for the audit trail only — once the
+    # order is live the broker owns the OCO group, not us.
+    stop_loss_price = Column(Float, nullable=True)
+    take_profit_price = Column(Float, nullable=True)
     fill_price = Column(Float, nullable=True)
     status = Column(String, nullable=False, index=True)  # accepted | filled | rejected | failed
     rejection_reason = Column(Text, nullable=True)

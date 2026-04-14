@@ -101,5 +101,33 @@ class BrokerClient(ABC):
         """
 
     @abstractmethod
+    def place_bracket_order(
+        self,
+        ticker: str,
+        qty: float,
+        side: str,
+        limit_price: float,
+        stop_loss_price: float,
+        take_profit_price: float,
+        paper_only: bool = True,
+    ) -> OrderResult:
+        """
+        Submit a bracket entry: a parent LIMIT order with an attached
+        take-profit limit and stop-loss stop, all bound as an OCO group at
+        the broker. When one exit fills, the other cancels automatically —
+        no polling loop on our side, no client-side drift.
+
+        v1 only supports BUY (long) entries. A broker that cannot natively
+        express a bracket group MUST raise rather than placing the parent
+        without the attached exits — the whole point of this method is the
+        guaranteed coupling.
+
+        Returns the OrderResult of the PARENT order. The attached exit legs
+        are tracked at the broker and won't appear in our executed_orders
+        table until the broker fills them (at which point the existing
+        position poll + journal close flow picks them up).
+        """
+
+    @abstractmethod
     def close_position(self, ticker: str) -> dict:
         """Close an open position by ticker. Returns the resulting order info."""

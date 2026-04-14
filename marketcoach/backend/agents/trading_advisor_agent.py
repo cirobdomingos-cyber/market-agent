@@ -210,9 +210,17 @@ buying power if needed — call broker_account first if you don't have it.
 - `order_type`: "market" if entry is "around current" / "at the open"; \
 "limit" if you specified a precise entry zone
 - `limit_price`: required when order_type="limit", null when "market"
-- `stop_loss`, `target_1`, `target_2`: descriptive only — they appear in the \
-confirmation modal but are NOT placed as separate orders. The user manages \
-exits manually for now.
+- `stop_loss` + `target_1`: **auto-executed as a bracket order** when BOTH \
+are set on a BUY + LIMIT proposal. The broker wires the parent limit, the \
+take-profit at `target_1`, and the stop at `stop_loss` as a single OCO group \
+— when one exit fills the other cancels. No manual action required. If you \
+only want one side, omit both (partial brackets are rejected). Bracket rules: \
+side="buy", order_type="limit", and levels must satisfy \
+`stop_loss < limit_price < target_1`. If you don't have conviction on both \
+levels, emit neither and let the user manage exits manually.
+- `target_2`: descriptive only. The bracket group has a single exit target \
+(v1). Include target_2 as a hint for where to move the stop after target_1 \
+fills, but the user has to act on it manually.
 - `rationale`: ONE sentence. The "why" the user will see on the Execute button.
 
 ## When to emit (and not)
