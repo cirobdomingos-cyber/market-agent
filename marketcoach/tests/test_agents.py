@@ -9,10 +9,12 @@ import pytest
 
 from backend.agents.base import BaseAgent, AgentResult
 from backend.agents.trading_advisor_agent import (
+    _build_system_blocks,
     _fmt_money,
     _format_positions,
     _format_theses,
-    SYSTEM_PROMPT_TEMPLATE,
+    DYNAMIC_CONTEXT_TEMPLATE,
+    STABLE_INTRO_FRAMEWORK,
 )
 from backend.tools.broker_tool import (
     BROKER_READ_TOOL,
@@ -103,12 +105,9 @@ class TestTradingAdvisorPrompt:
     def test_format_theses_empty(self):
         assert _format_theses([]) == "No open theses."
 
-    def test_template_renders_with_all_fields(self):
-        """The template must format cleanly when every context field is supplied."""
-        from backend.agents.trading_advisor_agent import _mode_banner
-
-        rendered = SYSTEM_PROMPT_TEMPLATE.format(
-            mode_banner=_mode_banner("paper"),
+    def test_dynamic_template_renders_with_all_fields(self):
+        """The dynamic context template must format cleanly with the runtime values."""
+        rendered = DYNAMIC_CONTEXT_TEMPLATE.format(
             mode_label="paper",
             portfolio_value="$100,000.00",
             buying_power="$200,000.00",
@@ -116,13 +115,22 @@ class TestTradingAdvisorPrompt:
             positions="  NVDA: 10 @ avg $400",
             signals="  TSLA [bullish]: earnings beat",
             theses="  AAPL (LONG, 0.7): iPhone cycle",
-            trade_proposal_addendum="",
         )
-        # Key framework anchors must be present
-        assert "Layer 1 — Macro Regime" in rendered
-        assert "Layer 4 — Trade Decision Matrix" in rendered
-        assert "2% rule" in rendered
         assert "$100,000.00" in rendered
+        assert "NVDA" in rendered
+        assert "TSLA" in rendered
+        assert "AAPL" in rendered
+
+    def test_stable_prefix_contains_framework_anchors(self):
+        """The cacheable prefix must contain the full reasoning framework so that
+        Claude can do its job from cache hits alone."""
+        assert "Layer 1 — Macro Regime" in STABLE_INTRO_FRAMEWORK
+        assert "Layer 4 — Trade Decision Matrix" in STABLE_INTRO_FRAMEWORK
+        assert "2% rule" in STABLE_INTRO_FRAMEWORK
+        assert "broker_account" in STABLE_INTRO_FRAMEWORK
+        # And the dynamic-only fields must NOT be in it
+        assert "{portfolio_value}" not in STABLE_INTRO_FRAMEWORK
+        assert "{positions}" not in STABLE_INTRO_FRAMEWORK
 
 
 class TestBrokerReadTool:

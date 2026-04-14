@@ -353,33 +353,23 @@ class TestAdvisorTradeProposalFlag:
     """The trade-proposal format must only be in the prompt when
     enable_trade_proposals=True. Briefs/reactions must NOT see it."""
 
+    def _rendered_blocks(self, enable_proposals: bool) -> str:
+        from backend.agents.trading_advisor_agent import _build_system_blocks
+        blocks = _build_system_blocks(
+            mode="paper",
+            enable_proposals=enable_proposals,
+            account={"portfolio_value": 100_000, "buying_power": 200_000, "cash": 100_000},
+            positions=[], signals=[], theses=[],
+        )
+        return "\n".join(b["text"] for b in blocks)
+
     def test_addendum_present_when_enabled(self):
-        from backend.agents.trading_advisor_agent import (
-            SYSTEM_PROMPT_TEMPLATE,
-            TRADE_PROPOSAL_ADDENDUM,
-            _mode_banner,
-        )
-        rendered = SYSTEM_PROMPT_TEMPLATE.format(
-            mode_banner=_mode_banner("paper"),
-            mode_label="paper",
-            portfolio_value="$100k", buying_power="$200k", cash="$100k",
-            positions="", signals="", theses="",
-            trade_proposal_addendum=TRADE_PROPOSAL_ADDENDUM,
-        )
+        rendered = self._rendered_blocks(enable_proposals=True)
         assert "trade-proposal" in rendered
         assert "Trade execution format" in rendered
 
     def test_addendum_absent_when_disabled(self):
-        from backend.agents.trading_advisor_agent import (
-            SYSTEM_PROMPT_TEMPLATE,
-            _mode_banner,
-        )
-        rendered = SYSTEM_PROMPT_TEMPLATE.format(
-            mode_banner=_mode_banner("paper"),
-            mode_label="paper",
-            portfolio_value="$100k", buying_power="$200k", cash="$100k",
-            positions="", signals="", theses="",
-            trade_proposal_addendum="",
-        )
+        rendered = self._rendered_blocks(enable_proposals=False)
         assert "trade-proposal" not in rendered
+        assert "Trade execution format" not in rendered
         assert "Trade execution format" not in rendered

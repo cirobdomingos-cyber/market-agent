@@ -19,7 +19,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import anthropic
 from pydantic import BaseModel
@@ -64,7 +64,7 @@ class BaseAgent(ABC):
 
     def _agentic_loop(
         self,
-        system: str,
+        system: Union[str, list[dict]],
         messages: list[dict],
         tools: list[dict],
         max_iterations: int = MAX_TOOL_ITERATIONS,
@@ -135,7 +135,7 @@ class BaseAgent(ABC):
 
     def _call_api(
         self,
-        system: str,
+        system: Union[str, list[dict]],
         messages: list[dict],
         tools: list[dict],
         max_retries: int = 3,
@@ -143,16 +143,24 @@ class BaseAgent(ABC):
         """
         Call the Anthropic API with automatic retry on rate limit (429).
         Uses exponential backoff: 30s, 60s, 120s.
+
+        `system` accepts either:
+          - str — a single system prompt (legacy path used by Coach, News, etc.)
+          - list[dict] — content blocks with optional cache_control markers
+            for prompt caching. Used by TradingAdvisor to cache the stable
+            framework prefix while re-rendering the dynamic account snapshot.
         """
         for attempt in range(max_retries):
             try:
-                return self.client.messages.create(
+                response = self.client.messages.create(
                     model=MODEL,
                     max_tokens=4096,
                     system=system,
                     messages=messages,
                     tools=tools if tools else anthropic.NOT_GIVEN,
                 )
+                self._log_cache_usage(response)
+                return response
             except anthropic.RateLimitError:
                 wait = 30 * (2 ** attempt)  # 30s, 60s, 120s
                 if attempt < max_retries - 1:
@@ -163,6 +171,35 @@ class BaseAgent(ABC):
                     time.sleep(wait)
                 else:
                     raise
+
+    @staticmethod
+    def _log_cache_usage(response: anthropic.types.Message) -> None:
+        """
+        Log Anthropic prompt-cache statistics if the response includes them.
+
+        Anthropic returns four input-token counters when caching is in play:
+          - input_tokens              : non-cached fresh tokens
+          - cache_creation_input_tokens : tokens written to the cache this call
+          - cache_read_input_tokens   : tokens read from the cache (cheap!)
+          - output_tokens             : completion tokens
+
+        We log these at INFO so the cost win is visible in production logs
+        without wading through DEBUG noise. Cache reads cost ~10% of normal
+        input tokens; cache writes cost ~125%; non-cached writes cost 100%.
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        if cache_read or cache_create:
+            logger.info(
+                "Anthropic usage: input=%d, output=%d, cache_create=%d, cache_read=%d",
+                getattr(usage, "input_tokens", 0) or 0,
+                getattr(usage, "output_tokens", 0) or 0,
+                cache_create,
+                cache_read,
+            )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

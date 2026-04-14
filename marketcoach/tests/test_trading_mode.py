@@ -15,7 +15,7 @@ import pytest
 
 from backend.config import Settings, settings
 from backend.agents.trading_advisor_agent import (
-    SYSTEM_PROMPT_TEMPLATE,
+    _build_system_blocks,
     _mode_banner,
     _fmt_money,
     _format_positions,
@@ -83,32 +83,36 @@ class TestDualSwitchLiveMode:
 
 
 class TestAdvisorPromptModeBanner:
-    """The advisor prompt must render the correct banner for each mode."""
+    """The advisor system blocks must include the correct banner for each mode."""
 
-    def _render(self, mode: str) -> str:
-        return SYSTEM_PROMPT_TEMPLATE.format(
-            mode_banner=_mode_banner(mode),
-            mode_label=mode,
-            portfolio_value="$100,000.00",
-            buying_power="$200,000.00",
-            cash="$50,000.00",
-            positions=_format_positions([]),
-            signals=_format_signals([]),
-            theses=_format_theses([]),
-            trade_proposal_addendum="",
+    def _render(self, mode: str, enable_proposals: bool = False) -> str:
+        """Render both blocks concatenated for substring assertions."""
+        blocks = _build_system_blocks(
+            mode=mode,
+            enable_proposals=enable_proposals,
+            account={
+                "portfolio_value": 100_000.00,
+                "buying_power": 200_000.00,
+                "cash": 50_000.00,
+            },
+            positions=[],
+            signals=[],
+            theses=[],
         )
+        return "\n".join(b["text"] for b in blocks)
 
     def test_paper_banner_rendered_for_paper_mode(self):
         rendered = self._render("paper")
         assert "PAPER TRADING" in rendered
         assert "REAL CAPITAL AT RISK" not in rendered
-        assert "Alpaca paper trading" in rendered
+        # Mode label appears in the dynamic snapshot
+        assert "Mode: paper" in rendered
 
     def test_live_banner_rendered_for_live_mode(self):
         rendered = self._render("live")
         assert "LIVE TRADING" in rendered
         assert "REAL CAPITAL AT RISK" in rendered
-        assert "Alpaca live trading" in rendered
+        assert "Mode: live" in rendered
         # The critical safety instructions must all be present
         assert "MORE conservative on position sizing" in rendered
         assert "dollar amount at risk" in rendered

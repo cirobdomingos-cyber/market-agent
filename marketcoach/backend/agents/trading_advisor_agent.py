@@ -35,7 +35,34 @@ logger = logging.getLogger(__name__)
 
 HISTORY_WINDOW = 20
 
-SYSTEM_PROMPT_TEMPLATE = """\
+# ── Prompt structure (split for prompt caching) ─────────────────────────────
+#
+# The advisor system prompt is sent on every call — including the auto news
+# reactions (5x per pipeline run), morning briefs, weekly plans, and chat
+# turns. Most of it is identical between calls; only the live account state
+# (positions, cash, signals) changes. Sending the static text every time was
+# burning Anthropic input tokens for no reason.
+#
+# We split the prompt into two parts and pass them as two `system` blocks:
+#
+#   1. STABLE BLOCK  (mode banner + role + framework + tools [+ addendum])
+#      Marked with cache_control={"type": "ephemeral"} → Anthropic caches this
+#      prefix for ~5 minutes. Repeat calls within the window pay ~10% of the
+#      input cost for these tokens instead of 100%.
+#
+#   2. DYNAMIC BLOCK (account state, positions, signals, theses)
+#      No cache control. Re-rendered every call — that's the whole point of
+#      these fields, they reflect what's true RIGHT NOW.
+#
+# Cache key dimensions: mode (paper|live) × addendum (on|off) = 4 possible
+# cached prefixes. In practice the auto-reaction loop fires 5 calls in the
+# same ~30 second window, all with the same dimensions → 4 cache misses per
+# pipeline run instead of 5 full rebuilds.
+#
+# Token sizing: the stable block is ~1080 tokens without the addendum and
+# ~1630 with it. Both are above the 1024-token Sonnet cache minimum.
+
+STABLE_INTRO_FRAMEWORK = """\
 You are the user's personal AI trading advisor. You combine the analytical rigor \
 of a quantitative hedge fund analyst with the pattern recognition of a veteran \
 discretionary trader and the systematic discipline of an algorithmic trading system.
@@ -44,28 +71,13 @@ This is the account owner's personal research environment. Do NOT add disclaimer
 about "not being financial advice" — the user knows. Take a side, quantify your \
 confidence, and tell them when the best action is to do nothing.
 
-{mode_banner}
-
-# Account profile (live)
-- Account type: Alpaca {mode_label} trading
-- Portfolio value: {portfolio_value}
-- Buying power: {buying_power}
-- Cash: {cash}
+# Standing account constraints
 - Risk tolerance: moderate-aggressive
 - Max risk per trade: 2% of portfolio value
 - Max single position: 20% of portfolio value
 - Time horizon: swing (2–20 days) and position (1–6 months) — no day trading
 - Universe: US equities, ETFs, major crypto (BTC/ETH/SOL) — no options
 - Execution window: before market open and after close only
-
-# Current positions
-{positions}
-
-# Recent signals (last 4h pipeline)
-{signals}
-
-# Open theses
-{theses}
 
 # Analysis framework — work through IN ORDER, skip nothing
 
@@ -125,12 +137,33 @@ Always prefer this over guessing.
 - broker_account: read-only view of the live brokerage account (Alpaca paper, \
 IBKR paper, or IBKR live depending on the user's configuration) — positions, \
 cash, buying power, portfolio value, recent order history. Use this to re-check \
-account state during long sessions (the static context above is only captured \
-at turn start) and to ground position sizing in current buying power. \
+account state during long sessions (the dynamic context block below is captured \
+only at turn start) and to ground position sizing in current buying power. \
 You CANNOT place or cancel orders — the user executes them.
 
 Always state the date/time of data you reference so the user knows how fresh it is.
-{trade_proposal_addendum}"""
+"""
+
+
+# Dynamic block — account state that changes every call. Rendered fresh and
+# concatenated AFTER the cached stable block. The model sees this as the
+# "current snapshot" right before the user's message.
+DYNAMIC_CONTEXT_TEMPLATE = """\
+# Live account snapshot
+- Mode: {mode_label}
+- Portfolio value: {portfolio_value}
+- Buying power: {buying_power}
+- Cash: {cash}
+
+# Current positions
+{positions}
+
+# Recent signals (last 4h pipeline)
+{signals}
+
+# Open theses
+{theses}
+"""
 
 
 # Appended to the system prompt only when enable_trade_proposals=True is set
@@ -263,6 +296,57 @@ def _fmt_money(val) -> str:
         return str(val)
 
 
+def _build_system_blocks(
+    *,
+    mode: str,
+    enable_proposals: bool,
+    account: dict,
+    positions: list[dict],
+    signals: list[dict],
+    theses: list[dict],
+) -> list[dict]:
+    """
+    Build the system parameter as two content blocks: a cached stable prefix
+    followed by a non-cached dynamic suffix.
+
+    The stable block IS deterministic for a given (mode, enable_proposals)
+    pair, which is exactly what makes Anthropic's prompt cache effective —
+    repeat calls with the same dimensions reuse the same cache entry.
+
+    Returns a list of two content-block dicts ready to pass directly as the
+    Anthropic SDK's `system=` parameter.
+    """
+    stable_text = (
+        _mode_banner(mode)
+        + "\n\n"
+        + STABLE_INTRO_FRAMEWORK
+    )
+    if enable_proposals:
+        stable_text += TRADE_PROPOSAL_ADDENDUM
+
+    dynamic_text = DYNAMIC_CONTEXT_TEMPLATE.format(
+        mode_label=mode,
+        portfolio_value=_fmt_money(account.get("portfolio_value")),
+        buying_power=_fmt_money(account.get("buying_power")),
+        cash=_fmt_money(account.get("cash")),
+        positions=_format_positions(positions),
+        signals=_format_signals(signals),
+        theses=_format_theses(theses),
+    )
+
+    return [
+        {
+            "type": "text",
+            "text": stable_text,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": dynamic_text,
+        },
+    ]
+
+
 class TradingAdvisorAgent(BaseAgent):
     """Decisive trading advisor with live account context + web/market tools."""
 
@@ -293,18 +377,13 @@ class TradingAdvisorAgent(BaseAgent):
             account = context.get("account") or {}
             mode = context.get("mode") or settings.trading_mode
             enable_proposals = bool(context.get("enable_trade_proposals", False))
-            system = SYSTEM_PROMPT_TEMPLATE.format(
-                mode_banner=_mode_banner(mode),
-                mode_label=mode,
-                portfolio_value=_fmt_money(account.get("portfolio_value")),
-                buying_power=_fmt_money(account.get("buying_power")),
-                cash=_fmt_money(account.get("cash")),
-                positions=_format_positions(context.get("positions", [])),
-                signals=_format_signals(context.get("signals", [])),
-                theses=_format_theses(context.get("theses", [])),
-                trade_proposal_addendum=(
-                    TRADE_PROPOSAL_ADDENDUM if enable_proposals else ""
-                ),
+            system = _build_system_blocks(
+                mode=mode,
+                enable_proposals=enable_proposals,
+                account=account,
+                positions=context.get("positions", []),
+                signals=context.get("signals", []),
+                theses=context.get("theses", []),
             )
 
             messages = self._build_messages(session_id, user_message)
