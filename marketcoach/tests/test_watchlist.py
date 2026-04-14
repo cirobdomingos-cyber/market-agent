@@ -197,21 +197,27 @@ class TestWatchlistUnblocksOrders:
     the POST /watchlist endpoint must immediately allow /orders/confirm to
     accept trades for that ticker, with no restart."""
 
-    def _valid_request(self, ticker="GLD"):
+    def _valid_request(self, ticker="GLD", with_advisor_context=False):
+        """Build a valid order request.
+
+        By default we send NO advisor context (rationale/session_id both
+        None) so the whitelist gate is testable in isolation. Tests that
+        want to verify the auto-whitelist path pass with_advisor_context=True.
+        """
         return {
             "ticker": ticker,
             "side": "buy",
             "qty": 10,
             "order_type": "market",
             "limit_price": None,
-            "rationale": "Test",
-            "advisor_session_id": "test",
+            "rationale": "Test" if with_advisor_context else None,
+            "advisor_session_id": "advisor-test" if with_advisor_context else None,
             "confirm_live_capital": False,
             "user_thesis": "Test thesis covering at least 10 chars",
         }
 
     def test_gld_rejected_when_not_on_watchlist(self, client, mock_broker):
-        # Empty watchlist — GLD should be rejected
+        # Empty watchlist — GLD should be rejected (no advisor context)
         with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post("/orders/confirm", json=self._valid_request())
         assert resp.status_code == 200
@@ -234,3 +240,23 @@ class TestWatchlistUnblocksOrders:
         with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post("/orders/confirm", json=self._valid_request())
         assert resp.json()["status"] == "rejected"
+
+    def test_advisor_trade_auto_whitelists_and_succeeds(
+        self, client, db, mock_broker
+    ):
+        """When advisor context is present, the whitelist gate auto-adds
+        the ticker and the order proceeds — the whole point of the UX fix."""
+        assert "GLD" not in crud.get_watchlist_tickers_set(db)  # sanity
+        with patch("backend.main.get_broker", return_value=mock_broker):
+            resp = client.post(
+                "/orders/confirm",
+                json=self._valid_request(with_advisor_context=True),
+            )
+        assert resp.status_code == 200
+        assert resp.json()["status"] in ("filled", "accepted")
+        # Ticker was auto-added with notes mentioning it came from advisor
+        assert "GLD" in crud.get_watchlist_tickers_set(db)
+        gld_row = next(
+            r for r in crud.list_watchlist_tickers(db) if r.ticker == "GLD"
+        )
+        assert "auto-added" in (gld_row.notes or "").lower()

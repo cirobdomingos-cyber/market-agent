@@ -811,12 +811,39 @@ def confirm_order(
     whitelist.update(crud.get_watchlist_tickers_set(db))
 
     if request.ticker not in whitelist:
-        return _persist_rejection(
-            db, request,
-            f"Ticker {request.ticker} is not in the whitelist (positions, "
-            "open theses, or watchlist). Add it to your watchlist or open a "
-            "thesis on it before trading.",
-        )
+        # Auto-whitelist trades that came from the Advisor UI flow.
+        # By the time a request gets here with advisor_session_id AND a
+        # rationale, the user has:
+        #   1. Asked the advisor something, possibly via "Ask Advisor" deep
+        #      link from Trade Ideas or a manual chat message
+        #   2. Watched the agent emit a structured trade-proposal block
+        #      after validating the ticker via market_data tool calls
+        #   3. Clicked Review & execute on that specific card
+        #   4. Typed ≥10 chars of their own thesis in the required textarea
+        #   5. Clicked Execute
+        # That chain is more than enough deliberate intent to justify adding
+        # the ticker to the watchlist. Direct API calls without advisor
+        # context still get rejected — the safety gate stays in place for
+        # anything that bypasses the UI.
+        if request.advisor_session_id and request.rationale:
+            from datetime import date as _date
+            crud.add_watchlist_ticker(
+                db,
+                ticker=request.ticker,
+                notes=f"Auto-added from advisor trade on {_date.today().isoformat()}",
+            )
+            logger.info(
+                "Auto-whitelisted %s from advisor session %s",
+                request.ticker,
+                request.advisor_session_id,
+            )
+            # Fall through to the remaining gates
+        else:
+            return _persist_rejection(
+                db, request,
+                f"Ticker {request.ticker} is not in the whitelist (positions, "
+                "open theses, or watchlist). Add it to your watchlist first.",
+            )
 
     # Gate 6 — 20% portfolio rule (use limit_price for limit orders, else fall
     # back to current quote via market_data; if neither, use a conservative

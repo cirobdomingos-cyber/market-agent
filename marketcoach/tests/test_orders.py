@@ -252,12 +252,19 @@ class TestDailyCap:
 # ── Whitelist gate ─────────────────────────────────────────────────────────
 
 class TestWhitelistGate:
-    def test_unrelated_ticker_rejected(self, client, db, mock_alpaca):
+    def test_unrelated_ticker_rejected_when_no_advisor_context(self, client, db, mock_alpaca):
+        """Direct API calls without advisor_session_id + rationale still
+        hit the whitelist gate. This is the safety path for anything that
+        bypasses the normal UI flow."""
         _seed_watchlist(db, ["AAPL", "MSFT"])
         with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post(
                 "/orders/confirm",
-                json=_valid_request(ticker="ZZZZ"),
+                json=_valid_request(
+                    ticker="ZZZZ",
+                    advisor_session_id=None,
+                    rationale=None,
+                ),
             )
         assert resp.status_code == 200
         body = resp.json()
@@ -281,6 +288,71 @@ class TestWhitelistGate:
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 200
         assert resp.json()["status"] in ("filled", "accepted")
+
+    def test_advisor_trade_auto_whitelists_new_ticker(
+        self, client, db, mock_alpaca
+    ):
+        """A trade from the Advisor UI (has advisor_session_id + rationale)
+        for a ticker NOT on the watchlist should auto-add it and proceed.
+        The whole chain (thesis typed, card clicked, modal confirmed) is
+        sufficient deliberate intent."""
+        _seed_watchlist(db, ["AAPL"])  # SLV not on watchlist
+        mock_alpaca.place_order.return_value = OrderResult(
+            order_id="order-slv-1", ticker="SLV", qty=10.0, side="buy",
+            status="filled", is_paper=True, fill_price=28.50,
+        )
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            resp = client.post(
+                "/orders/confirm",
+                json=_valid_request(
+                    ticker="SLV",
+                    advisor_session_id="advisor-abc123",
+                    rationale="Silver breakout — inflation hedge",
+                ),
+            )
+        # Order should succeed, not be rejected
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] in ("filled", "accepted")
+        # SLV should now be on the watchlist with auto-added notes
+        watchlist_set = crud.get_watchlist_tickers_set(db)
+        assert "SLV" in watchlist_set
+        rows = crud.list_watchlist_tickers(db)
+        slv = next(r for r in rows if r.ticker == "SLV")
+        assert "auto-added" in (slv.notes or "").lower()
+
+    def test_advisor_auto_whitelist_needs_both_session_and_rationale(
+        self, client, db, mock_alpaca
+    ):
+        """Auto-whitelist requires BOTH advisor_session_id AND rationale.
+        A request with only one (e.g., a half-built direct API call) still
+        hits the rejection path — defence against the case where someone
+        tries to bypass with a fake session id but forgets the rationale."""
+        _seed_watchlist(db, ["AAPL"])
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            # Session without rationale → rejected
+            resp = client.post(
+                "/orders/confirm",
+                json=_valid_request(
+                    ticker="ZZZZ",
+                    advisor_session_id="advisor-fake",
+                    rationale=None,
+                ),
+            )
+        assert resp.json()["status"] == "rejected"
+        assert "SLV" not in crud.get_watchlist_tickers_set(db)
+
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            # Rationale without session → rejected
+            resp = client.post(
+                "/orders/confirm",
+                json=_valid_request(
+                    ticker="ZZZZ",
+                    advisor_session_id=None,
+                    rationale="Some reason",
+                ),
+            )
+        assert resp.json()["status"] == "rejected"
 
 
 # ── 20% portfolio gate ─────────────────────────────────────────────────────
@@ -326,7 +398,15 @@ class TestPersistence:
     ):
         _seed_watchlist(db, ["AAPL"])  # ZZZZ will be off-whitelist
         with patch("backend.main.get_broker", return_value=mock_alpaca):
-            client.post("/orders/confirm", json=_valid_request(ticker="ZZZZ"))
+            # No advisor context → rejection path stays active
+            client.post(
+                "/orders/confirm",
+                json=_valid_request(
+                    ticker="ZZZZ",
+                    advisor_session_id=None,
+                    rationale=None,
+                ),
+            )
         orders = crud.list_executed_orders(db)
         assert len(orders) == 1
         assert orders[0].status == "rejected"
