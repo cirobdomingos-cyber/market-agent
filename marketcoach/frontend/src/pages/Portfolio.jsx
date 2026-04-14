@@ -10,6 +10,7 @@ export default function Portfolio() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    let cancelled = false
     async function fetchData() {
       try {
         const [portRes, ordRes, accRes] = await Promise.all([
@@ -17,16 +18,25 @@ export default function Portfolio() {
           axios.get(`${API}/portfolio/orders`).catch(() => ({ data: [] })),
           axios.get(`${API}/accuracy`),
         ])
+        if (cancelled) return
         setPortfolio(portRes.data)
         setOrders(ordRes.data || [])
         setAccuracy(accRes.data)
       } catch (err) {
         console.error('Failed to load portfolio:', err)
       } finally {
-        setLoading(false)
+        if (!cancelled) setLoading(false)
       }
     }
     fetchData()
+    // Auto-refresh every 15s so position changes appear without manual reload.
+    // 15s is the sweet spot: fast enough to feel live after a trade, slow
+    // enough to not hammer IBKR's socket.
+    const id = setInterval(fetchData, 15_000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
   }, [])
 
   if (loading) return <p className="text-gray-500 text-sm">Loading portfolio...</p>

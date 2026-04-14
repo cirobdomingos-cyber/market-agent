@@ -346,6 +346,13 @@ export default function Journal() {
 
   useEffect(() => {
     fetchEntries()
+    // Auto-refresh every 20s so the open/closed state stays live after the
+    // position polling job detects a close on the backend (polls every 5min).
+    // 20s is slow enough to not hammer the DB, fast enough that you won't
+    // wait long after an async close becomes visible.
+    const id = setInterval(fetchEntries, 20_000)
+    return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab])
 
   return (

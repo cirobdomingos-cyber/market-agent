@@ -429,7 +429,22 @@ class Orchestrator:
             )
             return 0
 
-        # Classify each ticker's change
+        # IMPORTANT: update the journal BEFORE running the review dedupe.
+        # Journal writes are cheap (no Anthropic call) and represent the
+        # ground truth of the position lifecycle — they must happen on
+        # every meaningful change, independent of review cost controls.
+        #
+        # The old version of this code ran _update_journal_from_changes AFTER
+        # the dedupe early-return, which meant a recent position_opened
+        # reaction would silently swallow the subsequent position_closed
+        # journal update when the user closed the trade within the dedupe
+        # window. Symptom: journal stuck on "open" even after the position
+        # actually closed.
+        self._update_journal_from_changes(all_tickers, current_by_ticker, previous)
+
+        # Classify each ticker's change for REVIEW GENERATION. Dedupe and
+        # per-poll cap apply only to reviews (which cost Anthropic tokens),
+        # not to the journal updates above.
         candidates: list[tuple[str, str, dict]] = []  # (ticker, reason, prompt_args)
         for ticker in all_tickers:
             current = current_by_ticker.get(ticker)
@@ -454,12 +469,6 @@ class Orchestrator:
         # Sort by priority and cap
         candidates.sort(key=lambda c: self._POSITION_REVIEW_PRIORITY[c[1]])
         candidates = candidates[: _settings.position_reviews_per_poll_max]
-
-        # Update the journal in lockstep with the reviews. This must happen
-        # for ALL classified changes, not just the top-N capped candidates,
-        # because a journal-only update is much cheaper than an Anthropic
-        # call and the journal needs to track every position lifecycle event.
-        self._update_journal_from_changes(all_tickers, current_by_ticker, previous)
 
         created = 0
         for ticker, reason, args in candidates:
@@ -568,7 +577,23 @@ class Orchestrator:
                 elif cur_qty == 0 and prev_qty != 0:
                     open_entry = crud.get_open_journal_entry_for_ticker(self.db, ticker)
                     if open_entry is not None:
-                        close_price = float(prev.current_price or 0) if prev else 0.0
+                        # Try the previous snapshot's current_price first
+                        # (Alpaca-style), fall back to yfinance last trade
+                        # (IBKR paper case — get_positions returns None for
+                        # current_price because we don't pay for real-time
+                        # data). If both fail, use the open_price so we at
+                        # least record a 0% P&L close instead of -100%.
+                        close_price = float(prev.current_price) if prev and prev.current_price else 0.0
+                        if not close_price:
+                            try:
+                                from backend.tools.market_data import execute_market_data
+                                quote = execute_market_data(action="quote", ticker=ticker)
+                                if isinstance(quote, dict) and quote.get("price"):
+                                    close_price = float(quote["price"])
+                            except Exception as exc:
+                                logger.debug("Close price yfinance fallback failed for %s: %s", ticker, exc)
+                        if not close_price:
+                            close_price = float(open_entry.open_price or 0)
                         open_price = float(open_entry.open_price or 0)
                         pnl_pct = (
                             ((close_price - open_price) / open_price * 100)

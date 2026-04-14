@@ -40,9 +40,11 @@ export default function Advisor() {
   const messagesEndRef = useRef(null)
 
   useEffect(() => {
+    let cancelled = false
     async function fetchPortfolio() {
       try {
         const res = await axios.get(`${API}/portfolio`)
+        if (cancelled) return
         setAccount(res.data.account || null)
         setPositions(res.data.positions || [])
       } catch (err) {
@@ -50,6 +52,12 @@ export default function Advisor() {
       }
     }
     fetchPortfolio()
+    // Auto-refresh every 15s so the sidebar stays live without hitting Refresh
+    const id = setInterval(fetchPortfolio, 15_000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
   }, [])
 
   useEffect(() => {
