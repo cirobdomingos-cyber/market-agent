@@ -895,7 +895,14 @@ def confirm_order(
         if isinstance(quote, dict) and "price" in quote and quote["price"]:
             estimated_price = float(quote["price"])
 
-    if estimated_price and portfolio_value:
+    # The 20% rule is a position-SIZING cap — it's meant to prevent a
+    # single BUY from blowing up concentration risk on the way in. Sells
+    # of existing long shares reduce risk and should never be rejected
+    # by this gate, even if the notional happens to be > 20% of equity
+    # (common for 100% closes of big positions). In v1 we don't support
+    # opening shorts via /orders/confirm, so "sell" always means
+    # "closing a long" — safe to skip.
+    if request.side == "buy" and estimated_price and portfolio_value:
         notional = estimated_price * request.qty
         max_notional = portfolio_value * PORTFOLIO_MAX_PCT
         if notional > max_notional:

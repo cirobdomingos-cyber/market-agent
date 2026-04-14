@@ -358,7 +358,7 @@ class TestWhitelistGate:
 # ── 20% portfolio gate ─────────────────────────────────────────────────────
 
 class TestPortfolioGate:
-    def test_oversized_order_rejected(self, client, mock_alpaca):
+    def test_oversized_buy_rejected(self, client, mock_alpaca):
         # 100 shares × $450 = $45,000 > 20% of $100k portfolio ($20k)
         with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post(
@@ -376,6 +376,30 @@ class TestPortfolioGate:
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 200
         assert resp.json()["status"] in ("filled", "accepted")
+
+    def test_oversized_sell_allowed(self, client, mock_alpaca):
+        """The 20% rule is a position-SIZING cap meant to prevent buys
+        from blowing up concentration risk. Sells of existing longs
+        reduce risk — they must never be rejected by this gate, even
+        when the notional is technically > 20% (common for 100% closes
+        of big positions)."""
+        mock_alpaca.place_order.return_value = OrderResult(
+            order_id="sell-big-1", ticker="NVDA", qty=100, side="sell",
+            status="filled", is_paper=True, fill_price=460.0,
+        )
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            resp = client.post(
+                "/orders/confirm",
+                json=_valid_request(
+                    side="sell",
+                    qty=100,
+                    limit_price=450.00,  # $45k notional > $20k cap
+                ),
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        # Should NOT be rejected by the portfolio gate
+        assert body["status"] in ("filled", "accepted")
 
 
 # ── Persistence ────────────────────────────────────────────────────────────

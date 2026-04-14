@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import axios from 'axios'
+import SellModal from '../components/SellModal'
 
 const API = '/api'
 
@@ -12,6 +13,9 @@ export default function Portfolio() {
   const [newNotes, setNewNotes] = useState('')
   const [watchlistError, setWatchlistError] = useState(null)
   const [loading, setLoading] = useState(true)
+  // Which position (if any) is currently open in the SellModal.
+  // null = modal closed; a position object = modal open for that row.
+  const [sellingPosition, setSellingPosition] = useState(null)
 
   const fetchWatchlist = async () => {
     try {
@@ -140,6 +144,7 @@ export default function Portfolio() {
                   <th className="text-right px-4 py-2">Current</th>
                   <th className="text-right px-4 py-2">P&L</th>
                   <th className="text-right px-4 py-2">P&L %</th>
+                  <th className="text-right px-4 py-2 w-20"></th>
                 </tr>
               </thead>
               <tbody>
@@ -171,6 +176,19 @@ export default function Portfolio() {
                         {hasPnl
                           ? `${isPositive ? '+' : ''}${Number(p.unrealised_pnl_pct).toFixed(2)}%`
                           : '—'}
+                      </td>
+                      <td className="px-4 py-2 text-right">
+                        {/* Only show Sell on non-zero positions. IBKR
+                            tombstone rows (qty=0) should not be sellable. */}
+                        {Number(p.qty) > 0 && (
+                          <button
+                            onClick={() => setSellingPosition(p)}
+                            title={`Sell ${p.ticker}`}
+                            className="px-2.5 py-1 text-xs bg-red-800/60 hover:bg-red-700 text-red-100 rounded font-medium transition-colors"
+                          >
+                            Sell
+                          </button>
+                        )}
                       </td>
                     </tr>
                   )
@@ -340,6 +358,31 @@ export default function Portfolio() {
           <p className="text-gray-500 text-sm">Run the pipeline to generate theses. They auto-resolve when expired.</p>
         )}
       </div>
+
+      {/* Sell modal — opened from the Sell button on each position row.
+          After successful execution, refreshes the full portfolio + orders
+          + watchlist set so the positions table reflects the reduced qty. */}
+      {sellingPosition && (
+        <SellModal
+          position={sellingPosition}
+          isLive={account && account.paper === false}
+          onClose={() => setSellingPosition(null)}
+          onExecuted={async () => {
+            setSellingPosition(null)
+            // Refresh the portfolio so the qty reduction appears
+            try {
+              const [portRes, ordRes] = await Promise.all([
+                axios.get(`${API}/portfolio`),
+                axios.get(`${API}/portfolio/orders`),
+              ])
+              setPortfolio(portRes.data)
+              setOrders(ordRes.data || [])
+            } catch (err) {
+              console.error('Post-sell refresh failed:', err)
+            }
+          }}
+        />
+      )}
     </div>
   )
 }
