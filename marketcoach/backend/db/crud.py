@@ -17,6 +17,7 @@ from backend.db.models import (
     MorningBrief,
     NewsReaction,
     Position,
+    PositionSnapshot,
     Signal,
     Thesis,
     TradeIdea,
@@ -423,6 +424,51 @@ def list_weekly_plans(db: Session, limit: int = 10) -> list[WeeklyPlan]:
         .limit(limit)
         .all()
     )
+
+
+# -- Position snapshots --------------------------------------------------------
+
+def create_position_snapshots(db: Session, snapshots: list[dict]) -> int:
+    """Bulk insert one snapshot per ticker. Returns count inserted."""
+    if not snapshots:
+        return 0
+    objects = [PositionSnapshot(**s) for s in snapshots]
+    db.add_all(objects)
+    db.commit()
+    return len(objects)
+
+
+def get_latest_position_snapshots(db: Session) -> dict[str, PositionSnapshot]:
+    """
+    Return the most-recent snapshot per ticker, as {ticker: PositionSnapshot}.
+
+    Used by the diff loop: take the current broker positions, look up each
+    ticker here, decide whether to fire a review.
+
+    Implementation note: SQLite doesn't have DISTINCT ON, so we query all
+    snapshots ordered by ticker + time-desc and dedupe in Python. Fine for
+    the row counts we expect (low thousands at most).
+    """
+    rows = (
+        db.query(PositionSnapshot)
+        .order_by(
+            PositionSnapshot.ticker.asc(),
+            PositionSnapshot.snapshot_at.desc(),
+        )
+        .all()
+    )
+    latest: dict[str, PositionSnapshot] = {}
+    for row in rows:
+        if row.ticker not in latest:
+            latest[row.ticker] = row
+    return latest
+
+
+def has_any_position_snapshot(db: Session) -> bool:
+    """True if at least one snapshot row exists. Used to detect 'first poll
+    ever' so we don't fire reviews for every existing position as if it were
+    just opened."""
+    return db.query(PositionSnapshot.id).first() is not None
 
 
 # -- Executed orders -----------------------------------------------------------

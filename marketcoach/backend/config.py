@@ -56,6 +56,19 @@ class Settings(BaseSettings):
     news_reaction_dedupe_hours: int = 6
     news_reaction_session_id: str = "news-reactions-auto"
 
+    # ── Auto position-change reviews ─────────────────────────────────────────
+    # Polling job that watches broker positions and auto-fires advisor reviews
+    # when something meaningful changes (new position, closed, qty changed, big
+    # P&L move). Reviews are persisted in news_reactions with trigger_reason
+    # values in {position_opened, position_closed, position_changed, pnl_threshold}.
+    position_reviews_enabled: bool = True
+    position_poll_interval_minutes: int = 5
+    position_qty_change_threshold_pct: float = 5.0   # qty change > N% → review
+    position_pnl_change_threshold_pct: float = 10.0  # P&L move > N pp → review
+    position_review_dedupe_hours: int = 4
+    position_reviews_per_poll_max: int = 5
+    position_review_session_id: str = "position-reviews-auto"
+
     # Weekly plan cron (APScheduler CronTrigger format)
     weekly_plan_enabled: bool = True
     weekly_plan_day_of_week: str = "sun"   # mon, tue, wed, thu, fri, sat, sun

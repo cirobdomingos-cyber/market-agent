@@ -153,6 +153,33 @@ class AutoRule(Base):
     created_at = Column(DateTime, default=_now_utc)
 
 
+class PositionSnapshot(Base):
+    """
+    Periodic snapshot of one position at a point in time. Written by the
+    position-change polling job so the next poll can diff against it.
+
+    We keep a row per (ticker, snapshot_at) rather than overwriting because:
+      - Restart-safe: the polling loop reads the latest snapshot per ticker
+      - Auditable: history is right there if we ever want to chart P&L over
+        time without paying for a market-data subscription
+      - Cheap: a few hundred rows/day for a small portfolio is nothing in SQLite
+
+    Closed positions are still represented — we write a row with qty=0 the
+    first time a previously-held ticker disappears, then stop emitting until
+    it comes back. That's how the diff knows the close was already handled.
+    """
+
+    __tablename__ = "position_snapshots"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    ticker = Column(String, nullable=False, index=True)
+    qty = Column(Float, nullable=False)
+    avg_entry = Column(Float, nullable=True)
+    current_price = Column(Float, nullable=True)
+    unrealised_pnl_pct = Column(Float, nullable=True)
+    snapshot_at = Column(DateTime, default=_now_utc, index=True)
+
+
 class ExecutedOrder(Base):
     """
     Audit trail of orders MarketCoach placed on the user's behalf.

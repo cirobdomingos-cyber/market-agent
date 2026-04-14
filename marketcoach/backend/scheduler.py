@@ -79,6 +79,27 @@ def _run_morning_brief() -> None:
         db.close()
 
 
+def _run_position_check() -> None:
+    """
+    Scheduled job: poll broker positions and auto-fire reviews on changes.
+
+    Runs every position_poll_interval_minutes. The poll itself is cheap (one
+    broker API call + a small DB diff). Anthropic is only called when an
+    actual change is detected, and the per-poll cap + dedupe window keep
+    cost bounded even if a lot of trades happen at once.
+    """
+    db = SessionLocal()
+    try:
+        orchestrator = Orchestrator(db)
+        created = orchestrator._check_position_changes()
+        if created > 0:
+            logger.info("Position poll: created %d reviews", created)
+    except Exception as exc:
+        logger.exception("Position poll failed: %s", exc)
+    finally:
+        db.close()
+
+
 def start_scheduler() -> None:
     scheduler.add_job(
         _run_intelligence_pipeline,
@@ -123,9 +144,21 @@ def start_scheduler() -> None:
             misfire_grace_time=3 * 3600,
         )
 
+    if settings.position_reviews_enabled:
+        scheduler.add_job(
+            _run_position_check,
+            trigger=IntervalTrigger(minutes=settings.position_poll_interval_minutes),
+            id="position_check",
+            name="Position Change Polling",
+            replace_existing=True,
+            # Short grace — if a poll is more than one interval late, just
+            # skip it. The next one will pick up any changes anyway.
+            misfire_grace_time=settings.position_poll_interval_minutes * 60,
+        )
+
     scheduler.start()
     logger.info(
-        "Scheduler started — intelligence=%dh, weekly=%s, morning=%s",
+        "Scheduler started — intelligence=%dh, weekly=%s, morning=%s, position_poll=%s",
         settings.agent_run_interval_hours,
         (
             f"{settings.weekly_plan_day_of_week} "
@@ -137,6 +170,11 @@ def start_scheduler() -> None:
             f"{settings.morning_brief_day_of_week} "
             f"{settings.morning_brief_hour:02d}:{settings.morning_brief_minute:02d}"
             if settings.morning_brief_enabled
+            else "disabled"
+        ),
+        (
+            f"every {settings.position_poll_interval_minutes}min"
+            if settings.position_reviews_enabled
             else "disabled"
         ),
     )

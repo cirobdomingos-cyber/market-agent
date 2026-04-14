@@ -81,3 +81,30 @@ class TestMorningBriefSchedule:
             assert scheduler_module.scheduler.get_job("morning_brief") is None
             # Other jobs should still be registered
             assert scheduler_module.scheduler.get_job("intelligence_pipeline") is not None
+
+
+class TestPositionPollSchedule:
+    def teardown_method(self):
+        if scheduler_module.scheduler.running:
+            scheduler_module.scheduler.shutdown(wait=False)
+        for job in list(scheduler_module.scheduler.get_jobs()):
+            job.remove()
+
+    def test_position_poll_job_registered_when_enabled(self):
+        from apscheduler.triggers.interval import IntervalTrigger
+        with patch.object(settings, "position_reviews_enabled", True), \
+             patch.object(settings, "position_poll_interval_minutes", 5):
+            scheduler_module.start_scheduler()
+            job = scheduler_module.scheduler.get_job("position_check")
+            assert job is not None
+            assert job.name == "Position Change Polling"
+            assert isinstance(job.trigger, IntervalTrigger)
+            # IntervalTrigger stores the interval as a timedelta
+            assert job.trigger.interval.total_seconds() == 5 * 60
+
+    def test_position_poll_job_not_registered_when_disabled(self):
+        with patch.object(settings, "position_reviews_enabled", False):
+            scheduler_module.start_scheduler()
+            assert scheduler_module.scheduler.get_job("position_check") is None
+            # Other jobs should still be registered
+            assert scheduler_module.scheduler.get_job("intelligence_pipeline") is not None
