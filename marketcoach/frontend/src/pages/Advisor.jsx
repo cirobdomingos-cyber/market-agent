@@ -32,12 +32,40 @@ function formatPct(v) {
   return `${sign}${n.toFixed(2)}%`
 }
 
+// localStorage key for the persistent sessionId. Until the user explicitly
+// clicks "New chat", every navigation back to the Advisor page reuses the
+// same session so the conversation history survives refreshes and page
+// transitions.
+const SESSION_STORAGE_KEY = 'marketcoach_advisor_session_id'
+
+function readOrCreateSessionId() {
+  try {
+    const existing = localStorage.getItem(SESSION_STORAGE_KEY)
+    if (existing && /^advisor-[a-zA-Z0-9_-]+$/.test(existing)) return existing
+  } catch {
+    /* localStorage may be disabled (rare); fall through */
+  }
+  const fresh = `advisor-${Date.now()}`
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, fresh)
+  } catch {
+    /* ignore */
+  }
+  return fresh
+}
+
 export default function Advisor() {
-  const [sessionId] = useState(() => `advisor-${Date.now()}`)
+  // Persistent sessionId so refreshing or navigating away doesn't wipe the
+  // conversation. "New chat" button below rotates it on demand.
+  const [sessionId, setSessionId] = useState(readOrCreateSessionId)
   const [messages, setMessages] = useState([])
   const [account, setAccount] = useState(null)
   const [positions, setPositions] = useState([])
   const [error, setError] = useState(null)
+  // "Thinking..." placeholder state while an advisor call is in flight.
+  // Renders as a pseudo-assistant message below the user's input so there's
+  // clear visual feedback that something is happening during the 30-90s wait.
+  const [isSending, setIsSending] = useState(false)
   const messagesEndRef = useRef(null)
   // Deep-link support: /advisor?prompt=... auto-sends that prompt on mount.
   // Used by the "Ask Advisor" button on the Trade Ideas page. We track
@@ -67,13 +95,42 @@ export default function Advisor() {
     }
   }, [])
 
+  // Load the conversation history for this sessionId on mount (and whenever
+  // the session rotates via "New chat"). Any prior messages from this session
+  // that were persisted to the chat_messages table come back onto the screen.
+  useEffect(() => {
+    let cancelled = false
+    async function loadHistory() {
+      try {
+        const res = await axios.get(`${API}/chat/${sessionId}`)
+        if (cancelled) return
+        // Backend returns [{id, role, content, created_at}, ...]. We only
+        // need role + content for rendering; the rest is metadata.
+        const history = (res.data || []).map((m) => ({
+          role: m.role,
+          content: m.content,
+        }))
+        setMessages(history)
+      } catch (err) {
+        // A brand-new session returns [] or 404; either way, empty state
+        // is the right UI.
+        if (!cancelled) setMessages([])
+      }
+    }
+    loadHistory()
+    return () => {
+      cancelled = true
+    }
+  }, [sessionId])
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, isSending])
 
   const handleSend = async (message) => {
     setError(null)
     setMessages((prev) => [...prev, { role: 'user', content: message }])
+    setIsSending(true)
 
     try {
       const res = await axios.post(`${API}/advisor`, {
@@ -94,7 +151,22 @@ export default function Advisor() {
           content: `**Error:** ${detail}`,
         },
       ])
+    } finally {
+      setIsSending(false)
     }
+  }
+
+  const startNewChat = () => {
+    const fresh = `advisor-${Date.now()}`
+    try {
+      localStorage.setItem(SESSION_STORAGE_KEY, fresh)
+    } catch {
+      /* ignore */
+    }
+    setSessionId(fresh)  // triggers loadHistory which returns []
+    setMessages([])
+    setError(null)
+    autoSentRef.current = false  // so a fresh ?prompt= on the new session works
   }
 
   // Auto-send the prompt from ?prompt=... on mount (deep-link from Trade
@@ -120,13 +192,22 @@ export default function Advisor() {
     <div className="flex flex-col lg:flex-row gap-4 lg:gap-6 lg:h-[85vh]">
       {/* Chat column */}
       <div className="flex-1 flex flex-col border border-gray-800 rounded-lg min-h-[60vh] lg:min-h-0">
-        <div className="border-b border-gray-800 px-4 py-3">
-          <h1 className="text-lg font-semibold text-white">Trading Advisor</h1>
-          <p className="text-xs text-gray-500 mt-0.5">
-            Decisive trade ideas with stop loss, targets, and risk/reward. Uses
-            live Alpaca account data + market tools. Not financial advice — this
-            is your personal research.
-          </p>
+        <div className="border-b border-gray-800 px-4 py-3 flex items-start justify-between gap-3">
+          <div className="flex-1">
+            <h1 className="text-lg font-semibold text-white">Trading Advisor</h1>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Decisive trade ideas with stop loss, targets, and risk/reward.
+              Uses live broker data + market tools. Not financial advice —
+              this is your personal research.
+            </p>
+          </div>
+          <button
+            onClick={startNewChat}
+            title="Clear this conversation and start fresh"
+            className="shrink-0 px-2.5 py-1 text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-gray-300 transition-colors"
+          >
+            New chat
+          </button>
         </div>
 
         <div className="flex-1 p-4 overflow-y-auto space-y-4">
@@ -194,6 +275,25 @@ export default function Advisor() {
               </div>
             )
           })}
+
+          {/* Thinking indicator while an advisor call is in flight. Appears
+              below the user's most recent message so the wait state is
+              obvious — advisor calls take 30–90s for tool-heavy analysis. */}
+          {isSending && (
+            <div className="text-sm text-indigo-100">
+              <span className="text-xs text-gray-500 uppercase font-medium">
+                Advisor
+              </span>
+              <div className="mt-1 flex items-center gap-2 text-indigo-200 italic">
+                <span className="inline-flex gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" style={{ animationDelay: '150ms' }} />
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" style={{ animationDelay: '300ms' }} />
+                </span>
+                <span>Thinking… (may take 30–90s for macro + tool analysis)</span>
+              </div>
+            </div>
+          )}
           <div ref={messagesEndRef} />
         </div>
 
