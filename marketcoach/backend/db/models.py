@@ -153,6 +153,80 @@ class AutoRule(Base):
     created_at = Column(DateTime, default=_now_utc)
 
 
+class TradeJournalEntry(Base):
+    """
+    A user-owned trade journal entry. Captures the full lifecycle of one
+    position: entry, the user's own thesis (in their own words, required),
+    the advisor's rationale if there was one, the close, and the user's
+    lesson learned after the fact.
+
+    Why this model exists separately from ExecutedOrder:
+      - ExecutedOrder is an audit trail of what happened ("MarketCoach
+        submitted these orders"). It's a system record.
+      - TradeJournalEntry is a reflection record. It pairs the system's
+        view of the trade with the user's reasoning at decision time and
+        their learning after the outcome is known.
+
+    The whole point is the discipline. The user_thesis MUST be filled in
+    before an order placed via /orders/confirm is allowed to execute, and
+    the user_lesson MUST be filled in after the position closes for the
+    entry to count as 'complete'. Half-filled entries surface as 'action
+    needed' in the Journal UI until the user finishes them.
+
+    Manual trades placed directly in Alpaca/IBKR (bypassing the Execute
+    button) are detected by the position polling job and inserted with
+    needs_thesis=True so the user can fill in the reasoning after the fact.
+    Less ideal than capturing it before execution, but better than nothing.
+    """
+
+    __tablename__ = "trade_journal_entries"
+
+    id = Column(String, primary_key=True, default=_uuid)
+
+    # Optional links to the executed-order rows that opened/closed the trade.
+    # Both are nullable because manual trades have no MarketCoach order record.
+    open_executed_order_id = Column(
+        String, ForeignKey("executed_orders.id"), nullable=True
+    )
+    close_executed_order_id = Column(
+        String, ForeignKey("executed_orders.id"), nullable=True
+    )
+
+    # Trade identity
+    ticker = Column(String, nullable=False, index=True)
+    side = Column(String, nullable=False)         # buy | sell — direction at open
+    qty = Column(Float, nullable=False)
+
+    # Open
+    open_price = Column(Float, nullable=False)
+    opened_at = Column(DateTime, nullable=False)
+
+    # User input (open) — the discipline lives here
+    user_thesis = Column(Text, nullable=True)            # in their own words
+    user_disagreement = Column(Text, nullable=True)      # vs the advisor, optional
+
+    # Advisor context — only present when the trade came from a chat
+    # recommendation (rationale was on the OrderConfirmRequest).
+    advisor_session_id = Column(String, nullable=True)
+    advisor_rationale = Column(Text, nullable=True)
+
+    # Close
+    close_price = Column(Float, nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+    pnl_amount = Column(Float, nullable=True)
+    pnl_pct = Column(Float, nullable=True)
+    days_held = Column(Integer, nullable=True)
+    advised_direction_profitable = Column(Boolean, nullable=True)
+
+    # User input (close) — the lesson learned
+    user_lesson = Column(Text, nullable=True)
+
+    # Status: open or closed. Whether action is needed is derived from
+    # presence of user_thesis (when open) and user_lesson (when closed).
+    status = Column(String, nullable=False, default="open", index=True)
+    created_at = Column(DateTime, default=_now_utc)
+
+
 class PositionSnapshot(Base):
     """
     Periodic snapshot of one position at a point in time. Written by the

@@ -12,6 +12,7 @@ import WeeklyPlan from './pages/WeeklyPlan'
 import NewsReactions from './pages/NewsReactions'
 import MorningBrief from './pages/MorningBrief'
 import ExecutedOrders from './pages/ExecutedOrders'
+import Journal from './pages/Journal'
 
 const API = '/api'
 const UNREAD_POLL_MS = 60_000
@@ -19,6 +20,7 @@ const UNREAD_POLL_MS = 60_000
 export default function App() {
   const [mode, setMode] = useState(null)
   const [unreadCount, setUnreadCount] = useState(0)
+  const [journalActionCount, setJournalActionCount] = useState(0)
 
   useEffect(() => {
     axios
@@ -31,8 +33,14 @@ export default function App() {
     let cancelled = false
     const poll = async () => {
       try {
-        const res = await axios.get(`${API}/news-reactions/unread-count`)
-        if (!cancelled) setUnreadCount(res.data.unread || 0)
+        const [reactions, journal] = await Promise.all([
+          axios.get(`${API}/news-reactions/unread-count`),
+          axios.get(`${API}/journal/action-needed-count`),
+        ])
+        if (!cancelled) {
+          setUnreadCount(reactions.data.unread || 0)
+          setJournalActionCount(journal.data.count || 0)
+        }
       } catch (err) {
         // Silent — endpoint may be temporarily down; nav still works
       }
@@ -127,6 +135,21 @@ export default function App() {
             Orders
           </NavLink>
           <NavLink
+            to="/journal"
+            className={({ isActive }) =>
+              `relative ${
+                isActive ? 'text-white font-medium' : 'text-gray-400 hover:text-white'
+              }`
+            }
+          >
+            Journal
+            {journalActionCount > 0 && (
+              <span className="ml-1.5 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-xs font-bold bg-amber-600 text-white rounded-full">
+                {journalActionCount > 99 ? '99+' : journalActionCount}
+              </span>
+            )}
+          </NavLink>
+          <NavLink
             to="/backtest"
             className={({ isActive }) =>
               isActive ? 'text-white font-medium' : 'text-gray-400 hover:text-white'
@@ -180,6 +203,7 @@ export default function App() {
             <Route path="/news-reactions" element={<NewsReactions />} />
             <Route path="/morning-brief" element={<MorningBrief />} />
             <Route path="/orders" element={<ExecutedOrders />} />
+            <Route path="/journal" element={<Journal />} />
           </Routes>
         </main>
       </div>

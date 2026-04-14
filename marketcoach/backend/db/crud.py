@@ -21,6 +21,7 @@ from backend.db.models import (
     Signal,
     Thesis,
     TradeIdea,
+    TradeJournalEntry,
     UserMemory,
     WeeklyPlan,
 )
@@ -423,6 +424,101 @@ def list_weekly_plans(db: Session, limit: int = 10) -> list[WeeklyPlan]:
         .order_by(WeeklyPlan.created_at.desc())
         .limit(limit)
         .all()
+    )
+
+
+# -- Trade journal entries -----------------------------------------------------
+
+def create_journal_entry(db: Session, **kwargs) -> TradeJournalEntry:
+    entry = TradeJournalEntry(**kwargs)
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def get_journal_entry(db: Session, entry_id: str) -> Optional[TradeJournalEntry]:
+    return (
+        db.query(TradeJournalEntry)
+        .filter(TradeJournalEntry.id == entry_id)
+        .first()
+    )
+
+
+def list_journal_entries(
+    db: Session,
+    status: Optional[str] = None,
+    limit: int = 100,
+) -> list[TradeJournalEntry]:
+    """Newest-first list of journal entries. Optional status filter."""
+    q = db.query(TradeJournalEntry)
+    if status is not None:
+        q = q.filter(TradeJournalEntry.status == status)
+    return q.order_by(TradeJournalEntry.created_at.desc()).limit(limit).all()
+
+
+def get_open_journal_entry_for_ticker(
+    db: Session, ticker: str
+) -> Optional[TradeJournalEntry]:
+    """
+    Return the oldest open entry for this ticker. Used by the position
+    polling job: when a ticker disappears from broker positions, find its
+    open journal entry so we can fill in the close fields.
+
+    Oldest-first because if there are multiple open entries (shouldn't
+    happen in v1, but possible if the user adds to a position via separate
+    orders), we want to close the earliest one first — FIFO accounting.
+    """
+    return (
+        db.query(TradeJournalEntry)
+        .filter(TradeJournalEntry.ticker == ticker)
+        .filter(TradeJournalEntry.status == "open")
+        .order_by(TradeJournalEntry.opened_at.asc())
+        .first()
+    )
+
+
+def update_journal_entry(
+    db: Session, entry_id: str, **fields
+) -> Optional[TradeJournalEntry]:
+    """Generic field updater. Used to add the user's thesis/lesson and to
+    fill in the close fields when the polling job detects a position close."""
+    entry = (
+        db.query(TradeJournalEntry)
+        .filter(TradeJournalEntry.id == entry_id)
+        .first()
+    )
+    if entry is None:
+        return None
+    for key, value in fields.items():
+        if hasattr(entry, key):
+            setattr(entry, key, value)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def count_journal_entries_needing_action(db: Session) -> int:
+    """
+    Count entries that need user input — either a missing thesis (open
+    trade with no thesis) or a missing lesson (closed trade with no
+    lesson). Used by the nav badge.
+    """
+    from sqlalchemy import or_
+    return (
+        db.query(func.count(TradeJournalEntry.id))
+        .filter(
+            or_(
+                # Open trades missing a thesis
+                (TradeJournalEntry.status == "open")
+                & ((TradeJournalEntry.user_thesis.is_(None)) | (TradeJournalEntry.user_thesis == "")),
+                # Closed trades missing a lesson
+                (TradeJournalEntry.status == "closed")
+                & ((TradeJournalEntry.user_lesson.is_(None)) | (TradeJournalEntry.user_lesson == "")),
+            )
+        )
+        .scalar()
+        or 0
     )
 
 

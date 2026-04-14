@@ -455,6 +455,12 @@ class Orchestrator:
         candidates.sort(key=lambda c: self._POSITION_REVIEW_PRIORITY[c[1]])
         candidates = candidates[: _settings.position_reviews_per_poll_max]
 
+        # Update the journal in lockstep with the reviews. This must happen
+        # for ALL classified changes, not just the top-N capped candidates,
+        # because a journal-only update is much cheaper than an Anthropic
+        # call and the journal needs to track every position lifecycle event.
+        self._update_journal_from_changes(all_tickers, current_by_ticker, previous)
+
         created = 0
         for ticker, reason, args in candidates:
             prompt_template = self._POSITION_REVIEW_PROMPTS[reason]
@@ -503,6 +509,116 @@ class Orchestrator:
 
         logger.info("Position poll: created %d reviews", created)
         return created
+
+    def _update_journal_from_changes(
+        self,
+        all_tickers: set[str],
+        current_by_ticker: dict[str, dict],
+        previous,  # dict[str, PositionSnapshot]
+    ) -> None:
+        """
+        Reconcile the trade journal with the latest broker snapshot.
+
+        Two cases:
+          1. A new ticker appears with no matching open journal entry →
+             this is a manual trade placed directly in Alpaca/IBKR. Create
+             a pending journal entry (no thesis yet — the user fills it in
+             after the fact via the Journal UI).
+
+          2. A previously-held ticker disappears (qty went to 0) → the
+             position closed. Find the matching open journal entry and fill
+             in the close fields. The user still needs to add their lesson
+             before the entry is "complete".
+
+        Both cases are best-effort. If the journal write fails for any
+        reason we log and continue — the polling job's main purpose
+        (generating reviews) must not be blocked by journal hiccups.
+        """
+        from datetime import datetime, timezone
+
+        for ticker in all_tickers:
+            current = current_by_ticker.get(ticker)
+            prev = previous.get(ticker)
+            cur_qty = float(current.get("qty") or 0) if current else 0.0
+            prev_qty = float(prev.qty) if prev else 0.0
+
+            try:
+                # Case 1: new position (or qty went from 0 to non-zero)
+                if cur_qty != 0 and prev_qty == 0:
+                    existing = crud.get_open_journal_entry_for_ticker(self.db, ticker)
+                    if existing is None:
+                        # No matching journal entry → manual trade. Create
+                        # one with no thesis so the UI can prompt for it.
+                        crud.create_journal_entry(
+                            self.db,
+                            ticker=ticker,
+                            side="buy",  # assume buys for opens
+                            qty=cur_qty,
+                            open_price=float(current.get("avg_entry") or 0),
+                            opened_at=datetime.now(timezone.utc),
+                            user_thesis=None,  # ← needs_thesis=True in the UI
+                            status="open",
+                        )
+                        logger.info(
+                            "Journal: created pending entry for manual trade on %s",
+                            ticker,
+                        )
+
+                # Case 2: position closed
+                elif cur_qty == 0 and prev_qty != 0:
+                    open_entry = crud.get_open_journal_entry_for_ticker(self.db, ticker)
+                    if open_entry is not None:
+                        close_price = float(prev.current_price or 0) if prev else 0.0
+                        open_price = float(open_entry.open_price or 0)
+                        pnl_pct = (
+                            ((close_price - open_price) / open_price * 100)
+                            if open_price > 0
+                            else None
+                        )
+                        pnl_amount = (
+                            (close_price - open_price) * float(open_entry.qty)
+                            if open_price > 0
+                            else None
+                        )
+                        # Was the buy direction profitable? Buys profit on rise.
+                        advised_profitable = (
+                            close_price > open_price
+                            if open_entry.side == "buy"
+                            else close_price < open_price
+                        )
+                        # SQLite stores DateTime as naive — normalize both
+                        # sides to naive UTC before subtracting to avoid
+                        # "can't subtract offset-naive and offset-aware".
+                        if open_entry.opened_at:
+                            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+                            opened_naive = (
+                                open_entry.opened_at.replace(tzinfo=None)
+                                if open_entry.opened_at.tzinfo
+                                else open_entry.opened_at
+                            )
+                            days_held = (now_naive - opened_naive).days
+                        else:
+                            days_held = None
+                        crud.update_journal_entry(
+                            self.db,
+                            open_entry.id,
+                            close_price=close_price,
+                            closed_at=datetime.now(timezone.utc),
+                            pnl_amount=pnl_amount,
+                            pnl_pct=pnl_pct,
+                            days_held=days_held,
+                            advised_direction_profitable=advised_profitable,
+                            status="closed",
+                        )
+                        logger.info(
+                            "Journal: closed entry for %s (P&L %.2f%%)",
+                            ticker,
+                            pnl_pct or 0,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "Journal update failed for %s: %s — continuing", ticker, exc
+                )
 
     def _write_position_snapshots(
         self,

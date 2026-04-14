@@ -22,6 +22,12 @@ export default function ConfirmTradeModal({
   // Live-mode safety: a separate checkbox the user must tick before the
   // submit button enables. Backend also validates this — defence in depth.
   const [confirmLive, setConfirmLive] = useState(false)
+  // Trade journal — the user MUST type their own thesis before executing.
+  // Disagreement is optional. Both feed into the journal entry on success.
+  const [userThesis, setUserThesis] = useState('')
+  const [userDisagreement, setUserDisagreement] = useState('')
+
+  const thesisValid = userThesis.trim().length >= 10
 
   const submit = async () => {
     setSubmitting(true)
@@ -36,6 +42,8 @@ export default function ConfirmTradeModal({
         rationale: proposal.rationale || null,
         advisor_session_id: advisorSessionId || null,
         confirm_live_capital: isLive ? confirmLive : false,
+        user_thesis: userThesis.trim(),
+        user_disagreement: userDisagreement.trim() || null,
       }
       const res = await axios.post(`${API}/orders/confirm`, body)
       onExecuted(res.data)
@@ -51,7 +59,8 @@ export default function ConfirmTradeModal({
     }
   }
 
-  const submitDisabled = submitting || (isLive && !confirmLive)
+  const submitDisabled =
+    submitting || !thesisValid || (isLive && !confirmLive)
 
   return (
     <div
@@ -130,10 +139,54 @@ export default function ConfirmTradeModal({
         )}
 
         {proposal.rationale && (
-          <p className="text-xs text-gray-400 italic mb-4 border-l-2 border-gray-700 pl-2">
-            "{proposal.rationale}"
-          </p>
+          <div className="mb-4">
+            <p className="text-[10px] uppercase tracking-wide text-gray-500 mb-1">
+              Advisor's rationale
+            </p>
+            <p className="text-xs text-gray-400 italic border-l-2 border-gray-700 pl-2">
+              "{proposal.rationale}"
+            </p>
+          </div>
         )}
+
+        {/* Trade journal — required. The whole point of the journal is the
+            discipline; if this were optional it'd always be skipped. */}
+        <div className="mb-4 p-3 bg-indigo-950/20 border border-indigo-900/50 rounded">
+          <label className="block text-xs font-semibold text-indigo-200 mb-1">
+            Your thesis <span className="text-red-400">*</span>
+          </label>
+          <p className="text-[10px] text-gray-500 mb-1.5">
+            In your own words. Why are you taking this trade? (10+ chars, required)
+          </p>
+          <textarea
+            value={userThesis}
+            onChange={(e) => setUserThesis(e.target.value)}
+            placeholder="e.g. NVDA breakout looks clean, volume confirms, AI demand thesis intact"
+            rows={2}
+            disabled={submitting}
+            className="w-full bg-gray-950 border border-gray-700 rounded px-2 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50"
+          />
+          {userThesis.length > 0 && !thesisValid && (
+            <p className="text-[10px] text-amber-400 mt-1">
+              Need at least 10 characters
+            </p>
+          )}
+
+          <label className="block text-xs font-semibold text-indigo-200 mt-3 mb-1">
+            Disagreement with the advisor (optional)
+          </label>
+          <p className="text-[10px] text-gray-500 mb-1.5">
+            Where do you see this differently? Leave blank if you fully agree.
+          </p>
+          <textarea
+            value={userDisagreement}
+            onChange={(e) => setUserDisagreement(e.target.value)}
+            placeholder="e.g. advisor is too cautious on size — I'm taking 2x"
+            rows={2}
+            disabled={submitting}
+            className="w-full bg-gray-950 border border-gray-700 rounded px-2 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50"
+          />
+        </div>
 
         {isLive && (
           <label className="flex items-start gap-2 text-xs text-red-200 mb-4 p-2 bg-red-950/40 border border-red-800 rounded cursor-pointer">

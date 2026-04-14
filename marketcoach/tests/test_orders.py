@@ -90,6 +90,8 @@ def _valid_request(**overrides):
         "rationale": "Bullish breakout test",
         "advisor_session_id": "advisor-test",
         "confirm_live_capital": False,
+        "user_thesis": "Test thesis: NVDA breakout looks clean on volume",
+        "user_disagreement": None,
     }
     base.update(overrides)
     return base

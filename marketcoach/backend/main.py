@@ -193,6 +193,11 @@ class OrderConfirmRequest(BaseModel):
     # Live mode safety: this field MUST be present and True when the system
     # is in live mode. The frontend modal collects an explicit checkbox for it.
     confirm_live_capital: bool = False
+    # Trade journal — the user MUST type their own thesis before executing.
+    # The whole point of the journal is the discipline; if these were optional
+    # they'd always be skipped. The UI enforces a min length too.
+    user_thesis: str = Field(min_length=10, max_length=500)
+    user_disagreement: Optional[str] = Field(default=None, max_length=500)
 
 
 class PipelineRunResponse(BaseModel):
@@ -813,7 +818,174 @@ def confirm_order(
         submitted_at=datetime.now(timezone.utc),
         filled_at=datetime.now(timezone.utc) if result.fill_price else None,
     )
+
+    # Create a trade journal entry alongside the executed order.
+    # This is the "discipline" capture: the user's thesis was required on
+    # the request, and we persist it now so the journal page can prompt
+    # for a lesson when the position closes.
+    #
+    # Only buys open new journal entries — sells are usually closes.
+    # Closes are detected by the position polling job, which finds the
+    # matching open journal entry and fills in the close fields.
+    if request.side == "buy":
+        # Use limit_price for limit orders, fill_price for market orders
+        open_price = result.fill_price or request.limit_price or 0.0
+        crud.create_journal_entry(
+            db,
+            open_executed_order_id=persisted.id,
+            ticker=result.ticker,
+            side=request.side,
+            qty=result.qty,
+            open_price=float(open_price),
+            opened_at=datetime.now(timezone.utc),
+            user_thesis=request.user_thesis,
+            user_disagreement=request.user_disagreement,
+            advisor_session_id=request.advisor_session_id,
+            advisor_rationale=request.rationale,
+            status="open",
+        )
+
     return _serialise_executed_order(persisted)
+
+
+def _serialise_journal_entry(e) -> dict:
+    needs_thesis = not e.user_thesis or e.user_thesis.strip() == ""
+    needs_lesson = e.status == "closed" and (
+        not e.user_lesson or e.user_lesson.strip() == ""
+    )
+    return {
+        "id": e.id,
+        "open_executed_order_id": e.open_executed_order_id,
+        "close_executed_order_id": e.close_executed_order_id,
+        "ticker": e.ticker,
+        "side": e.side,
+        "qty": e.qty,
+        "open_price": e.open_price,
+        "opened_at": e.opened_at.isoformat() if e.opened_at else None,
+        "user_thesis": e.user_thesis,
+        "user_disagreement": e.user_disagreement,
+        "advisor_session_id": e.advisor_session_id,
+        "advisor_rationale": e.advisor_rationale,
+        "close_price": e.close_price,
+        "closed_at": e.closed_at.isoformat() if e.closed_at else None,
+        "pnl_amount": e.pnl_amount,
+        "pnl_pct": e.pnl_pct,
+        "days_held": e.days_held,
+        "advised_direction_profitable": e.advised_direction_profitable,
+        "user_lesson": e.user_lesson,
+        "status": e.status,
+        "needs_thesis": needs_thesis,
+        "needs_lesson": needs_lesson,
+        "needs_action": needs_thesis or needs_lesson,
+        "created_at": e.created_at.isoformat() if e.created_at else None,
+    }
+
+
+class JournalThesisRequest(BaseModel):
+    user_thesis: str = Field(min_length=10, max_length=500)
+    user_disagreement: Optional[str] = Field(default=None, max_length=500)
+
+
+class JournalLessonRequest(BaseModel):
+    user_lesson: str = Field(min_length=10, max_length=1000)
+
+
+@app.get("/journal")
+def list_journal(
+    status: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """
+    List journal entries. Optional status filter (open|closed).
+    Always returns newest-first.
+    """
+    if status is not None and status not in ("open", "closed"):
+        raise HTTPException(status_code=422, detail="Invalid status filter")
+    entries = crud.list_journal_entries(
+        db, status=status, limit=min(max(1, limit), 500)
+    )
+    return [_serialise_journal_entry(e) for e in entries]
+
+
+@app.get("/journal/action-needed-count")
+def journal_action_needed_count(
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """Lightweight count for the nav badge — polled by the UI."""
+    return {"count": crud.count_journal_entries_needing_action(db)}
+
+
+@app.get("/journal/{entry_id}")
+def get_journal_entry_route(
+    entry_id: str,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    entry = crud.get_journal_entry(db, entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Journal entry not found")
+    return _serialise_journal_entry(entry)
+
+
+@app.post("/journal/{entry_id}/thesis")
+def add_journal_thesis(
+    entry_id: str,
+    request: JournalThesisRequest,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """
+    Backfill the thesis on a journal entry that was created without one
+    (i.e., a manual trade detected by the polling job).
+    """
+    entry = crud.get_journal_entry(db, entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Journal entry not found")
+    if entry.user_thesis and entry.user_thesis.strip():
+        raise HTTPException(
+            status_code=409,
+            detail="This entry already has a thesis. Theses are immutable.",
+        )
+    updated = crud.update_journal_entry(
+        db,
+        entry_id,
+        user_thesis=request.user_thesis,
+        user_disagreement=request.user_disagreement,
+    )
+    return _serialise_journal_entry(updated)
+
+
+@app.post("/journal/{entry_id}/lesson")
+def add_journal_lesson(
+    entry_id: str,
+    request: JournalLessonRequest,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """
+    Add the lesson learned to a closed journal entry. Only valid after
+    the position has closed (status=closed). Lessons are immutable once set.
+    """
+    entry = crud.get_journal_entry(db, entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Journal entry not found")
+    if entry.status != "closed":
+        raise HTTPException(
+            status_code=409,
+            detail="Lesson can only be added after the position closes.",
+        )
+    if entry.user_lesson and entry.user_lesson.strip():
+        raise HTTPException(
+            status_code=409,
+            detail="This entry already has a lesson. Lessons are immutable.",
+        )
+    updated = crud.update_journal_entry(
+        db, entry_id, user_lesson=request.user_lesson
+    )
+    return _serialise_journal_entry(updated)
 
 
 @app.get("/orders/executed")
