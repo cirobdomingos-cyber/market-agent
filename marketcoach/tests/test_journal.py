@@ -476,3 +476,178 @@ class TestJournalEndpoints:
             json={"user_lesson": "short"},
         )
         assert resp.status_code == 422
+
+
+# ── 4. Close-price ground truth from executed_orders ──────────────────────
+
+class TestFindLatestSellFillCrud:
+    """The crud.find_latest_sell_fill helper — ground truth for close prices."""
+
+    def test_returns_none_when_no_orders(self, db):
+        assert crud.find_latest_sell_fill(db, "NVDA") is None
+
+    def test_returns_none_when_only_buys(self, db):
+        crud.create_executed_order(
+            db, ticker="NVDA", side="buy", qty=10, order_type="market",
+            status="filled", fill_price=450.0, is_paper=True,
+        )
+        assert crud.find_latest_sell_fill(db, "NVDA") is None
+
+    def test_returns_none_for_unfilled_sell(self, db):
+        """Accepted-but-not-yet-filled limit sells shouldn't count —
+        fill_price is None until the broker reports execution."""
+        crud.create_executed_order(
+            db, ticker="NVDA", side="sell", qty=10, order_type="limit",
+            limit_price=470.0, status="accepted", fill_price=None, is_paper=True,
+        )
+        assert crud.find_latest_sell_fill(db, "NVDA") is None
+
+    def test_returns_filled_sell(self, db):
+        crud.create_executed_order(
+            db, ticker="NVDA", side="sell", qty=10, order_type="market",
+            status="filled", fill_price=460.50, is_paper=True,
+        )
+        result = crud.find_latest_sell_fill(db, "NVDA")
+        assert result is not None
+        assert result.fill_price == 460.50
+
+    def test_filters_by_ticker(self, db):
+        crud.create_executed_order(
+            db, ticker="NVDA", side="sell", qty=10, order_type="market",
+            status="filled", fill_price=460.0, is_paper=True,
+        )
+        assert crud.find_latest_sell_fill(db, "AAPL") is None
+        assert crud.find_latest_sell_fill(db, "NVDA") is not None
+
+    def test_after_dt_filter(self, db):
+        """A sell from before the journal's open should not match — it's
+        from a prior lifecycle and must not overwrite the current close."""
+        import time
+        # Old sell
+        crud.create_executed_order(
+            db, ticker="NVDA", side="sell", qty=10, order_type="market",
+            status="filled", fill_price=400.0, is_paper=True,
+        )
+        time.sleep(0.01)
+        cutoff = datetime.now(timezone.utc)
+        time.sleep(0.01)
+        # New sell after the cutoff
+        crud.create_executed_order(
+            db, ticker="NVDA", side="sell", qty=10, order_type="market",
+            status="filled", fill_price=450.0, is_paper=True,
+        )
+        result = crud.find_latest_sell_fill(db, "NVDA", after_dt=cutoff)
+        assert result.fill_price == 450.0
+
+    def test_returns_most_recent_when_multiple(self, db):
+        import time
+        crud.create_executed_order(
+            db, ticker="NVDA", side="sell", qty=5, order_type="market",
+            status="filled", fill_price=440.0, is_paper=True,
+        )
+        time.sleep(0.01)
+        crud.create_executed_order(
+            db, ticker="NVDA", side="sell", qty=5, order_type="market",
+            status="filled", fill_price=455.0, is_paper=True,
+        )
+        assert crud.find_latest_sell_fill(db, "NVDA").fill_price == 455.0
+
+
+class TestCloseDetectionPrefersExecutedOrder:
+    """Integration: when the position polling detects a close, the journal
+    entry's close_price must come from the executed_orders sell fill first,
+    not from yfinance or the snapshot's current_price."""
+
+    def test_close_uses_executed_orders_fill_not_yfinance(self, db):
+        """Seed an open journal entry + matching sell in executed_orders +
+        a snapshot with a DIFFERENT current_price. When polling detects
+        the position disappearing, the journal's close_price must come
+        from the executed_orders sell, not from the snapshot or yfinance."""
+        from backend.agents.orchestrator import Orchestrator
+        from backend.db.models import PositionSnapshot
+        from unittest.mock import MagicMock
+
+        # Journal entry was opened at $450
+        entry_opened_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        crud.create_journal_entry(
+            db, ticker="NVDA", side="buy", qty=10, open_price=450.0,
+            opened_at=entry_opened_at,
+            user_thesis="Test thesis for NVDA", status="open",
+        )
+        # Actual sell fill: $455 — recorded via /orders/confirm
+        crud.create_executed_order(
+            db, ticker="NVDA", side="sell", qty=10, order_type="market",
+            status="filled", fill_price=455.0, is_paper=True,
+        )
+        # Snapshot with a WRONG current_price — simulates Alpaca returning
+        # a stale snapshot from before the close actually filled
+        db.add(PositionSnapshot(
+            ticker="NVDA", qty=10, avg_entry=450.0,
+            current_price=470.0,  # ← stale / wrong; must NOT be used
+            unrealised_pnl_pct=4.4,
+        ))
+        db.commit()
+
+        # Build orchestrator with mocked broker returning qty=0
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.db = db
+        orch.client = MagicMock()
+
+        # Simulate the close-detection path directly with a synthesized
+        # current/previous map
+        from backend.db.crud import get_latest_position_snapshots
+        previous = get_latest_position_snapshots(db)
+        current_by_ticker = {"NVDA": {
+            "ticker": "NVDA", "qty": 0.0, "avg_entry": 0.0,
+            "current_price": None, "unrealised_pnl": None,
+            "unrealised_pnl_pct": None,
+        }}
+        all_tickers = {"NVDA"}
+        orch._update_journal_from_changes(all_tickers, current_by_ticker, previous)
+
+        # The journal entry should now be closed with close_price = $455
+        # (from executed_orders), NOT $470 (stale snapshot) or the yfinance
+        # fallback
+        closed = crud.list_journal_entries(db, status="closed")
+        assert len(closed) == 1
+        assert closed[0].close_price == 455.0
+        assert closed[0].pnl_amount == pytest.approx((455 - 450) * 10)
+        assert closed[0].pnl_pct == pytest.approx((455 - 450) / 450 * 100, rel=1e-4)
+        assert closed[0].advised_direction_profitable is True
+
+    def test_close_falls_back_to_snapshot_when_no_executed_sell(self, db):
+        """If there's no executed_orders sell (manual close via broker
+        dashboard), fall back to the snapshot's current_price."""
+        from backend.agents.orchestrator import Orchestrator
+        from backend.db.models import PositionSnapshot
+        from unittest.mock import MagicMock
+
+        entry_opened_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        crud.create_journal_entry(
+            db, ticker="AAPL", side="buy", qty=5, open_price=180.0,
+            opened_at=entry_opened_at,
+            user_thesis="Test thesis AAPL", status="open",
+        )
+        # NO executed_orders sell for AAPL
+        db.add(PositionSnapshot(
+            ticker="AAPL", qty=5, avg_entry=180.0,
+            current_price=185.0, unrealised_pnl_pct=2.8,
+        ))
+        db.commit()
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.db = db
+        orch.client = MagicMock()
+
+        from backend.db.crud import get_latest_position_snapshots
+        previous = get_latest_position_snapshots(db)
+        current_by_ticker = {"AAPL": {
+            "ticker": "AAPL", "qty": 0.0, "avg_entry": 0.0,
+            "current_price": None, "unrealised_pnl": None,
+            "unrealised_pnl_pct": None,
+        }}
+        orch._update_journal_from_changes({"AAPL"}, current_by_ticker, previous)
+
+        closed = crud.list_journal_entries(db, status="closed")
+        assert len(closed) == 1
+        assert closed[0].close_price == 185.0  # from snapshot fallback

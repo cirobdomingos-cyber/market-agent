@@ -584,19 +584,51 @@ class Orchestrator:
                 elif cur_qty == 0 and prev_qty != 0:
                     open_entry = crud.get_open_journal_entry_for_ticker(self.db, ticker)
                     if open_entry is not None:
-                        # Try the previous snapshot's current_price first
-                        # (Alpaca-style), fall back to yfinance last trade
-                        # (IBKR paper case — get_positions returns None for
-                        # current_price because we don't pay for real-time
-                        # data). If both fail, use the open_price so we at
-                        # least record a 0% P&L close instead of -100%.
-                        close_price = float(prev.current_price) if prev and prev.current_price else 0.0
+                        # Close-price lookup priority (ground truth first):
+                        #
+                        #   1. The actual SELL fill from executed_orders
+                        #      — the authoritative price the broker gave us
+                        #      when the order executed. This is what really
+                        #      happened and should always win when available.
+                        #
+                        #   2. The previous snapshot's current_price — valid
+                        #      for Alpaca (which fills current_price in
+                        #      get_positions). IBKR paper returns None here
+                        #      because we don't pay for real-time data.
+                        #
+                        #   3. A yfinance quote via the market_data tool —
+                        #      approximation for brokers that can't supply
+                        #      real-time quotes. Accurate to within a few
+                        #      minutes, not a few cents.
+                        #
+                        #   4. The open_price as a break-even fallback —
+                        #      better than recording a phantom -100% if all
+                        #      other lookups fail.
+                        close_price = 0.0
+                        sell_fill = crud.find_latest_sell_fill(
+                            self.db,
+                            ticker,
+                            after_dt=open_entry.opened_at,
+                        )
+                        if sell_fill and sell_fill.fill_price:
+                            close_price = float(sell_fill.fill_price)
+                            logger.info(
+                                "Journal close for %s: using executed_orders fill $%.4f",
+                                ticker, close_price,
+                            )
+                        if not close_price and prev and prev.current_price:
+                            close_price = float(prev.current_price)
                         if not close_price:
                             try:
                                 from backend.tools.market_data import execute_market_data
                                 quote = execute_market_data(action="quote", ticker=ticker)
                                 if isinstance(quote, dict) and quote.get("price"):
                                     close_price = float(quote["price"])
+                                    logger.info(
+                                        "Journal close for %s: using yfinance quote $%.4f "
+                                        "(no executed_orders sell found)",
+                                        ticker, close_price,
+                                    )
                             except Exception as exc:
                                 logger.debug("Close price yfinance fallback failed for %s: %s", ticker, exc)
                         if not close_price:

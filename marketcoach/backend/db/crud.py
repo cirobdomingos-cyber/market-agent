@@ -673,6 +673,40 @@ def list_executed_orders(
     return q.order_by(ExecutedOrder.created_at.desc()).limit(limit).all()
 
 
+def find_latest_sell_fill(
+    db: Session,
+    ticker: str,
+    after_dt: Optional[datetime] = None,
+) -> Optional[ExecutedOrder]:
+    """
+    Return the most recent filled SELL order for a ticker, optionally
+    restricted to fills after a given time. Used by the close-detection
+    path to grab the *actual* sell fill price that was executed on the
+    broker, instead of falling back to yfinance's stale current quote.
+
+    Only considers rows with status='filled' AND a non-null fill_price.
+    Accepted-but-not-yet-filled limit orders are ignored because their
+    fill_price is None until the broker reports execution.
+    """
+    ticker_u = (ticker or "").upper()
+    q = (
+        db.query(ExecutedOrder)
+        .filter(ExecutedOrder.ticker == ticker_u)
+        .filter(ExecutedOrder.side == "sell")
+        .filter(ExecutedOrder.status == "filled")
+        .filter(ExecutedOrder.fill_price.isnot(None))
+    )
+    if after_dt is not None:
+        # SQLite stores naive datetimes — normalize the filter to match.
+        normalized = (
+            after_dt.replace(tzinfo=None)
+            if after_dt.tzinfo is not None
+            else after_dt
+        )
+        q = q.filter(ExecutedOrder.created_at >= normalized)
+    return q.order_by(ExecutedOrder.created_at.desc()).first()
+
+
 def count_orders_today(db: Session) -> int:
     """Number of order attempts (any status) created in the last 24 hours.
     Used by the per-day cap to prevent runaway from a stuck loop."""
