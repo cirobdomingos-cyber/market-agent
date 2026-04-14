@@ -114,6 +114,16 @@ class IBKRBroker(BrokerClient):
 
     def _ensure_connected(self) -> bool:
         """Connect to IB Gateway on first use. Returns False on any failure."""
+        # FastAPI's sync endpoints run in a threadpool — every request may
+        # land in a different worker thread. ib_insync's sync shims need an
+        # event loop in the current thread to drive the async internals, and
+        # this must happen on EVERY call, not just on the initial connect.
+        # The first /portfolio call connected on thread A, a subsequent call
+        # on thread B failed with "no current event loop in thread" because
+        # this setup ran only on the connect path. Move it to the top so
+        # every method benefits.
+        _ensure_thread_event_loop()
+
         if self._ib is not None and self._ib.isConnected():
             return True
 
@@ -123,10 +133,6 @@ class IBKRBroker(BrokerClient):
                 "and start IB Gateway to enable IBKR broker"
             )
             return False
-
-        # FastAPI sync endpoints run in worker threads with no default event
-        # loop. ib_insync needs one to run its async internals on.
-        _ensure_thread_event_loop()
 
         try:
             ib = _IB()
@@ -142,6 +148,9 @@ class IBKRBroker(BrokerClient):
             return False
 
     def is_connected(self) -> bool:
+        # Called from /health in a worker thread — needs a loop in case
+        # ib_insync's isConnected() touches anything loop-dependent.
+        _ensure_thread_event_loop()
         return self._ib is not None and self._ib.isConnected()
 
     # ── Read operations ──────────────────────────────────────────────────────
