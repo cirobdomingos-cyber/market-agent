@@ -26,7 +26,7 @@ from backend.agents.trading_advisor_agent import TradingAdvisorAgent
 from backend.agents.base import AgentResult
 from backend.config import settings
 from backend.db import crud
-from backend.tools.alpaca import init_alpaca_client, get_alpaca_client
+from backend.brokers import get_broker
 
 logger = logging.getLogger(__name__)
 
@@ -77,13 +77,13 @@ class Orchestrator:
         if analysis_result.success and analysis_result.data.get("theses"):
             # Get portfolio value from Alpaca if available
             portfolio_value = 100_000.0  # default
-            alpaca = get_alpaca_client()
+            broker = get_broker()
             existing_positions = []
-            if alpaca:
-                account = alpaca.get_account()
+            if broker:
+                account = broker.get_account()
                 if "portfolio_value" in account:
                     portfolio_value = account["portfolio_value"]
-                existing_positions = alpaca.get_positions()
+                existing_positions = broker.get_positions()
 
             # Get user risk tolerance from memories
             risk_tolerance = "moderate"
@@ -180,11 +180,11 @@ class Orchestrator:
             return 0
 
         # Gate 2 — relevance classification
-        alpaca = get_alpaca_client()
+        broker = get_broker()
         position_tickers: set[str] = set()
-        if alpaca:
+        if broker:
             position_tickers = {
-                (p.get("ticker") or "").upper() for p in alpaca.get_positions()
+                (p.get("ticker") or "").upper() for p in broker.get_positions()
             }
         thesis_tickers = {
             (t.ticker or "").upper() for t in crud.get_open_theses(self.db, limit=100)
@@ -274,9 +274,9 @@ class Orchestrator:
         Enriches context with Alpaca portfolio data if available.
         """
         # Inject live portfolio from Alpaca if configured
-        alpaca = get_alpaca_client()
-        if alpaca:
-            context.setdefault("portfolio", alpaca.get_positions())
+        broker = get_broker()
+        if broker:
+            context.setdefault("portfolio", broker.get_positions())
 
         coach = CoachAgent(self.db, self.client)
         result = coach.run(context)
@@ -312,10 +312,10 @@ class Orchestrator:
         user_message. Enriches context with live Alpaca account data and
         positions so the prompt can ground position sizing in real numbers.
         """
-        alpaca = get_alpaca_client()
-        if alpaca:
-            context.setdefault("account", alpaca.get_account())
-            context.setdefault("positions", alpaca.get_positions())
+        broker = get_broker()
+        if broker:
+            context.setdefault("account", broker.get_account())
+            context.setdefault("positions", broker.get_positions())
         else:
             context.setdefault("account", {})
             context.setdefault("positions", [])

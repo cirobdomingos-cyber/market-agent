@@ -38,7 +38,7 @@ from backend.db import get_db, init_db
 from backend.db import crud
 from backend.agents.orchestrator import Orchestrator
 from backend.scheduler import start_scheduler, stop_scheduler
-from backend.tools.alpaca import AlpacaClient, init_alpaca_client, get_alpaca_client
+from backend.brokers import init_broker, get_broker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,36 +73,64 @@ async def lifespan(app: FastAPI):
     logger.info("MarketCoach starting up")
     init_db()
 
-    # Initialize the Alpaca client singleton (if keys are configured).
-    # Trading mode is gated by a dual switch: alpaca_paper=False is not
-    # enough on its own — the confirmation phrase must also be set. If the
-    # user sets paper=False without the phrase, we refuse to start live and
-    # fall back to paper with a loud warning.
-    if settings.alpaca_api_key and settings.alpaca_secret_key:
-        is_live = settings.is_live_mode
-        if settings.alpaca_paper is False and not is_live:
-            logger.warning(
-                "ALPACA_PAPER=false but ALPACA_LIVE_CONFIRMATION is missing or "
-                "incorrect. Refusing to start in live mode — falling back to "
-                "paper. Set ALPACA_LIVE_CONFIRMATION='%s' to enable live.",
-                settings.LIVE_CONFIRMATION_PHRASE,
+    # Initialize the broker singleton. Provider is chosen by settings.broker_provider
+    # ("alpaca" | "ibkr"). Trading mode is gated by the same dual switch regardless
+    # of provider: alpaca_paper=False is not enough — the confirmation phrase must
+    # also be set. If the user sets paper=False without the phrase, we refuse to
+    # start in live mode and fall back to paper with a loud warning.
+    is_live = settings.is_live_mode
+    if settings.alpaca_paper is False and not is_live:
+        logger.warning(
+            "ALPACA_PAPER=false but ALPACA_LIVE_CONFIRMATION is missing or "
+            "incorrect. Refusing to start in live mode — falling back to "
+            "paper. Set ALPACA_LIVE_CONFIRMATION='%s' to enable live.",
+            settings.LIVE_CONFIRMATION_PHRASE,
+        )
+
+    provider = settings.broker_provider.lower().strip()
+    if provider == "alpaca":
+        if settings.alpaca_api_key and settings.alpaca_secret_key:
+            init_broker(
+                "alpaca",
+                api_key=settings.alpaca_api_key,
+                secret_key=settings.alpaca_secret_key,
+                paper=not is_live,
             )
-        init_alpaca_client(
-            api_key=settings.alpaca_api_key,
-            secret_key=settings.alpaca_secret_key,
+        else:
+            logger.warning(
+                "BROKER_PROVIDER=alpaca but ALPACA_API_KEY/ALPACA_SECRET_KEY are "
+                "not set. Broker features disabled until you add credentials."
+            )
+    elif provider == "ibkr":
+        init_broker(
+            "ibkr",
+            host=settings.ibkr_host,
+            port=settings.ibkr_port,
+            client_id=settings.ibkr_client_id,
             paper=not is_live,
         )
+    else:
+        logger.warning(
+            "Unknown BROKER_PROVIDER='%s'. Broker features disabled.",
+            settings.broker_provider,
+        )
+
+    if get_broker() is not None:
         if is_live:
             logger.warning(
                 "═══════════════════════════════════════════════════════════"
             )
-            logger.warning("  ALPACA CLIENT INITIALISED IN LIVE MODE")
-            logger.warning("  Real capital is at risk. Automation disabled.")
+            logger.warning(
+                "  BROKER (%s) INITIALISED IN LIVE MODE", provider.upper()
+            )
+            logger.warning("  Real capital is at risk.")
             logger.warning(
                 "═══════════════════════════════════════════════════════════"
             )
         else:
-            logger.info("Alpaca client initialised (paper mode)")
+            logger.info(
+                "Broker (%s) initialised in paper mode", provider
+            )
 
     start_scheduler()
     yield
@@ -191,11 +219,15 @@ class BacktestRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    alpaca = get_alpaca_client()
+    broker = get_broker()
     return {
         "status": "ok",
         "version": "0.2.0",
-        "alpaca_connected": alpaca is not None and alpaca._client is not None,
+        # Field name kept as alpaca_connected for frontend backwards-compat;
+        # the value now reflects whichever broker is active (Alpaca or IBKR).
+        "broker": settings.broker_provider,
+        "broker_connected": broker is not None and broker.is_connected(),
+        "alpaca_connected": broker is not None and broker.is_connected(),
     }
 
 
@@ -562,7 +594,7 @@ def get_chat_history(session_id: str, db: Session = Depends(get_db)):
 @app.get("/portfolio")
 def get_portfolio(_auth: str = Depends(require_auth)):
     """Return paper positions and account summary from Alpaca."""
-    client = get_alpaca_client()
+    client = get_broker()
     if client is None:
         return {
             "account": {"status": "disconnected", "message": "Alpaca not configured"},
@@ -580,7 +612,7 @@ def get_order_history(
     _auth: str = Depends(require_auth),
 ):
     """Return recent order history from Alpaca."""
-    client = get_alpaca_client()
+    client = get_broker()
     if client is None:
         return []
     return client.get_order_history(limit=limit)
@@ -674,7 +706,7 @@ def confirm_order(
         )
 
     # Gate 3 — Alpaca must be connected
-    client = get_alpaca_client()
+    client = get_broker()
     if client is None:
         raise HTTPException(
             status_code=503,

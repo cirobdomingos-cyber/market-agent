@@ -166,7 +166,7 @@ class TestReactionFilter:
 
     def test_low_confidence_filtered_out(self, db):
         orch = _make_orchestrator(db)
-        with patch("backend.agents.orchestrator.get_alpaca_client", return_value=None):
+        with patch("backend.agents.orchestrator.get_broker", return_value=None):
             n = orch._trigger_news_reactions([
                 self._signal("NVDA", confidence=0.5),
             ])
@@ -175,7 +175,7 @@ class TestReactionFilter:
 
     def test_neutral_sentiment_filtered_out(self, db):
         orch = _make_orchestrator(db)
-        with patch("backend.agents.orchestrator.get_alpaca_client", return_value=None):
+        with patch("backend.agents.orchestrator.get_broker", return_value=None):
             n = orch._trigger_news_reactions([
                 self._signal("NVDA", sentiment="neutral"),
             ])
@@ -184,7 +184,7 @@ class TestReactionFilter:
     def test_unrelated_ticker_filtered_out(self, db):
         """Tickers not in positions/theses/watchlist must be skipped."""
         orch = _make_orchestrator(db)
-        with patch("backend.agents.orchestrator.get_alpaca_client", return_value=None):
+        with patch("backend.agents.orchestrator.get_broker", return_value=None):
             n = orch._trigger_news_reactions([
                 self._signal("RANDOM_NOT_IN_LIST"),
             ])
@@ -198,7 +198,7 @@ class TestReactionFilter:
                 success=True, data={"reply": "advisor markdown"}
             )
         )
-        with patch("backend.agents.orchestrator.get_alpaca_client", return_value=None):
+        with patch("backend.agents.orchestrator.get_broker", return_value=None):
             n = orch._trigger_news_reactions([self._signal("NVDA")])
         assert n == 1
         reactions = crud.list_news_reactions(db)
@@ -220,7 +220,7 @@ class TestReactionFilter:
         mock_alpaca.get_positions.return_value = [{"ticker": "AAPL"}]
 
         with patch.object(settings, "news_reactions_per_run_max", 1), \
-             patch("backend.agents.orchestrator.get_alpaca_client", return_value=mock_alpaca):
+             patch("backend.agents.orchestrator.get_broker", return_value=mock_alpaca):
             n = orch._trigger_news_reactions([
                 self._signal("NVDA"),  # watchlist only
                 self._signal("AAPL"),  # position
@@ -246,7 +246,7 @@ class TestReactionFilter:
         orch.run_advisor = MagicMock(
             return_value=AgentResult(success=True, data={"reply": "x"})
         )
-        with patch("backend.agents.orchestrator.get_alpaca_client", return_value=None):
+        with patch("backend.agents.orchestrator.get_broker", return_value=None):
             n = orch._trigger_news_reactions([self._signal("NVDA")])
         assert n == 0
         # Still only the original reaction
@@ -258,7 +258,7 @@ class TestReactionFilter:
             return_value=AgentResult(success=True, data={"reply": "x"})
         )
         with patch.object(settings, "news_reactions_per_run_max", 2), \
-             patch("backend.agents.orchestrator.get_alpaca_client", return_value=None):
+             patch("backend.agents.orchestrator.get_broker", return_value=None):
             n = orch._trigger_news_reactions([
                 self._signal("NVDA"),
                 self._signal("AAPL"),
@@ -277,7 +277,7 @@ class TestReactionFilter:
                 success=False, data={"reply": ""}, error="rate limit"
             )
         )
-        with patch("backend.agents.orchestrator.get_alpaca_client", return_value=None):
+        with patch("backend.agents.orchestrator.get_broker", return_value=None):
             n = orch._trigger_news_reactions([self._signal("NVDA")])
         assert n == 1
         r = crud.list_news_reactions(db)[0]

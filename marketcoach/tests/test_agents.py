@@ -14,10 +14,10 @@ from backend.agents.trading_advisor_agent import (
     _format_theses,
     SYSTEM_PROMPT_TEMPLATE,
 )
-from backend.tools.alpaca import (
-    ALPACA_READ_TOOL,
+from backend.tools.broker_tool import (
+    BROKER_READ_TOOL,
     _READ_ONLY_ACTIONS,
-    execute_alpaca_read_tool,
+    execute_broker_read_tool,
 )
 
 
@@ -125,15 +125,16 @@ class TestTradingAdvisorPrompt:
         assert "$100,000.00" in rendered
 
 
-class TestAlpacaReadTool:
-    """Read-only Alpaca tool must refuse writes and expose the right surface."""
+class TestBrokerReadTool:
+    """Broker-agnostic read-only tool must refuse writes and expose the right surface."""
 
-    def test_tool_name_is_distinct_from_full_tool(self):
-        """The advisor sees a differently-named tool so it won't confuse the two."""
-        assert ALPACA_READ_TOOL["name"] == "alpaca_account"
+    def test_tool_name_is_broker_account(self):
+        """Renamed from alpaca_account when we added the broker abstraction so
+        the tool name doesn't lie about which provider it talks to."""
+        assert BROKER_READ_TOOL["name"] == "broker_account"
 
     def test_tool_schema_enum_is_read_only(self):
-        allowed = ALPACA_READ_TOOL["input_schema"]["properties"]["action"]["enum"]
+        allowed = BROKER_READ_TOOL["input_schema"]["properties"]["action"]["enum"]
         assert set(allowed) == {"get_positions", "get_account", "get_order_history"}
         assert "place_order" not in allowed
         assert "close_position" not in allowed
@@ -141,25 +142,25 @@ class TestAlpacaReadTool:
     def test_read_only_actions_constant_matches_schema(self):
         """_READ_ONLY_ACTIONS must stay in sync with the tool schema enum."""
         schema_enum = set(
-            ALPACA_READ_TOOL["input_schema"]["properties"]["action"]["enum"]
+            BROKER_READ_TOOL["input_schema"]["properties"]["action"]["enum"]
         )
         assert _READ_ONLY_ACTIONS == schema_enum
 
     def test_write_action_rejected(self):
-        """place_order must be rejected without touching the Alpaca client."""
-        result = execute_alpaca_read_tool("place_order", ticker="NVDA", qty=1, side="buy")
+        """place_order must be rejected without touching the broker."""
+        result = execute_broker_read_tool("place_order", ticker="NVDA", qty=1, side="buy")
         assert "error" in result
         assert "read-only" in result["error"].lower()
 
     def test_close_position_rejected(self):
-        result = execute_alpaca_read_tool("close_position", ticker="NVDA")
+        result = execute_broker_read_tool("close_position", ticker="NVDA")
         assert "error" in result
         assert "read-only" in result["error"].lower()
 
-    def test_read_action_with_no_client_returns_clean_error(self):
-        """With no client initialised, get_positions should surface a clear error."""
-        # In the test suite _client_instance is None — execute_alpaca_tool
-        # returns an explicit "not initialised" error, not a crash.
-        result = execute_alpaca_read_tool("get_positions")
+    def test_read_action_with_no_broker_returns_clean_error(self):
+        """With no broker initialised, get_positions should surface a clear error."""
+        from backend.brokers.factory import reset_broker
+        reset_broker()
+        result = execute_broker_read_tool("get_positions")
         assert "error" in result
         assert "not initialised" in result["error"].lower()

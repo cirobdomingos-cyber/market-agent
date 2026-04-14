@@ -8,14 +8,31 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str
 
+    # ── Broker selection ─────────────────────────────────────────────────────
+    # Which broker MarketCoach talks to. "alpaca" by default (the original
+    # integration); "ibkr" for Interactive Brokers via ib_insync. Brazilian
+    # residents need IBKR because Alpaca won't onboard them for live accounts.
+    # The selection happens once at startup; switch by editing .env and restarting.
+    broker_provider: str = "alpaca"
+
+    # ── Alpaca credentials ───────────────────────────────────────────────────
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
 
+    # ── IBKR connection (only used when broker_provider == "ibkr") ───────────
+    # IBKR requires a local IB Gateway / TWS process, not direct internet.
+    # Default port 7497 = paper, 7496 = live. Client ID can be anything 1-32
+    # but must be unique per simultaneously-connected client.
+    ibkr_host: str = "127.0.0.1"
+    ibkr_port: int = 7497
+    ibkr_client_id: int = 1
+
     # ── Real-capital safety gate ─────────────────────────────────────────────
     # Defaults to paper. Going live requires BOTH flags flipped — a single
     # misconfiguration (env var typo, accidental merge) can never put real
-    # money at risk on its own. Defence in depth.
+    # money at risk on its own. Defence in depth. Applies to whichever broker
+    # is active — the gate is broker-agnostic.
     alpaca_paper: bool = True
     # Must equal the exact string "I understand this uses real capital" for
     # live mode to activate. Deliberately verbose so nobody sets it by reflex.

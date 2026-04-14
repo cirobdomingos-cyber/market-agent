@@ -5,8 +5,8 @@ The /orders/confirm endpoint is the most consequential thing in the codebase
 — it's the only path that actually moves money. These tests cover every
 safety gate, every rejection reason, and the persistence audit trail.
 
-The Alpaca client is mocked at the get_alpaca_client level so we never
-hit the real API.
+The broker client is mocked at the get_broker level so we never
+hit the real Alpaca/IBKR API.
 """
 
 from unittest.mock import patch, MagicMock
@@ -21,7 +21,7 @@ from backend.config import Settings, settings
 from backend.db import crud, get_db
 from backend.db.models import Base
 from backend.main import app
-from backend.tools.alpaca import OrderResult
+from backend.brokers import OrderResult
 
 
 _engine = create_engine(
@@ -149,7 +149,7 @@ class TestLiveModeGate:
         monkeypatch.setattr(settings, "alpaca_paper", True)
         monkeypatch.setattr(settings, "alpaca_live_confirmation", "")
 
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(confirm_live_capital=False),
@@ -165,7 +165,7 @@ class TestLiveModeGate:
             Settings.LIVE_CONFIRMATION_PHRASE,
         )
 
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(confirm_live_capital=False),
@@ -181,7 +181,7 @@ class TestLiveModeGate:
             Settings.LIVE_CONFIRMATION_PHRASE,
         )
 
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(confirm_live_capital=True),
@@ -193,7 +193,7 @@ class TestLiveModeGate:
 
 class TestConnectionGate:
     def test_no_alpaca_client_returns_503(self, client):
-        with patch("backend.main.get_alpaca_client", return_value=None):
+        with patch("backend.main.get_broker", return_value=None):
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 503
         assert "alpaca" in resp.json()["detail"].lower()
@@ -216,7 +216,7 @@ class TestDailyCap:
                 is_paper=True,
             )
 
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post("/orders/confirm", json=_valid_request())
 
         # The 21st attempt is rejected (with persisted row, status 200 + body)
@@ -231,7 +231,7 @@ class TestDailyCap:
 class TestWhitelistGate:
     def test_unrelated_ticker_rejected(self, client, mock_alpaca, monkeypatch):
         monkeypatch.setattr(settings, "default_watchlist", "AAPL,MSFT")
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(ticker="ZZZZ"),
@@ -243,7 +243,7 @@ class TestWhitelistGate:
 
     def test_watchlist_ticker_passes(self, client, mock_alpaca, monkeypatch):
         monkeypatch.setattr(settings, "default_watchlist", "NVDA,AAPL")
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 200
         body = resp.json()
@@ -254,7 +254,7 @@ class TestWhitelistGate:
     ):
         monkeypatch.setattr(settings, "default_watchlist", "AAPL")
         mock_alpaca.get_positions.return_value = [{"ticker": "NVDA"}]
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 200
         assert resp.json()["status"] in ("filled", "accepted")
@@ -265,7 +265,7 @@ class TestWhitelistGate:
 class TestPortfolioGate:
     def test_oversized_order_rejected(self, client, mock_alpaca):
         # 100 shares × $450 = $45,000 > 20% of $100k portfolio ($20k)
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(qty=100, limit_price=450.00),
@@ -277,7 +277,7 @@ class TestPortfolioGate:
 
     def test_within_limit_passes(self, client, mock_alpaca):
         # 10 × $450 = $4,500 < $20k → ok
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 200
         assert resp.json()["status"] in ("filled", "accepted")
@@ -287,7 +287,7 @@ class TestPortfolioGate:
 
 class TestPersistence:
     def test_successful_order_persisted(self, client, db, mock_alpaca):
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             client.post("/orders/confirm", json=_valid_request())
         orders = crud.list_executed_orders(db)
         assert len(orders) == 1
@@ -302,7 +302,7 @@ class TestPersistence:
         self, client, db, mock_alpaca, monkeypatch
     ):
         monkeypatch.setattr(settings, "default_watchlist", "AAPL")
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             client.post("/orders/confirm", json=_valid_request(ticker="ZZZZ"))
         orders = crud.list_executed_orders(db)
         assert len(orders) == 1
@@ -312,7 +312,7 @@ class TestPersistence:
 
     def test_alpaca_failure_persisted(self, client, db, mock_alpaca):
         mock_alpaca.place_order.side_effect = Exception("Alpaca 500: server error")
-        with patch("backend.main.get_alpaca_client", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
             client.post("/orders/confirm", json=_valid_request())
         orders = crud.list_executed_orders(db)
         assert len(orders) == 1

@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from backend.agents.base import AgentResult, BaseAgent
 from backend.config import settings
 from backend.db import crud
-from backend.tools.alpaca import ALPACA_READ_TOOL, execute_alpaca_read_tool
+from backend.tools.broker_tool import BROKER_READ_TOOL, execute_broker_read_tool
 from backend.tools.market_data import MARKET_DATA_TOOL, execute_market_data
 from backend.tools.web_search import WEB_SEARCH_TOOL, execute_web_search
 
@@ -122,8 +122,9 @@ econ data) + watchlist trades with entry levels + position management notes.
 - market_data: current prices, technicals, fundamentals for any ticker. \
 Always prefer this over guessing.
 - web_search: current news, earnings dates, macro events, Fed commentary.
-- alpaca_account: read-only view of the live paper account — positions, cash, \
-buying power, portfolio value, recent order history. Use this to re-check \
+- broker_account: read-only view of the live brokerage account (Alpaca paper, \
+IBKR paper, or IBKR live depending on the user's configuration) — positions, \
+cash, buying power, portfolio value, recent order history. Use this to re-check \
 account state during long sessions (the static context above is only captured \
 at turn start) and to ground position sizing in current buying power. \
 You CANNOT place or cancel orders — the user executes them.
@@ -163,7 +164,7 @@ trade the user could place RIGHT NOW, emit a fenced code block tagged \
 - `side`: "buy" or "sell" (use "sell" to close an existing long, or to open \
 a short if the user has shorting enabled)
 - `qty`: CONCRETE share count, never a percentage. Calculate from current \
-buying power if needed — call alpaca_account first if you don't have it.
+buying power if needed — call broker_account first if you don't have it.
 - `order_type`: "market" if entry is "around current" / "at the open"; \
 "limit" if you specified a precise entry zone
 - `limit_price`: required when order_type="limit", null when "market"
@@ -311,7 +312,7 @@ class TradingAdvisorAgent(BaseAgent):
             response = self._agentic_loop(
                 system=system,
                 messages=messages,
-                tools=[WEB_SEARCH_TOOL, MARKET_DATA_TOOL, ALPACA_READ_TOOL],
+                tools=[WEB_SEARCH_TOOL, MARKET_DATA_TOOL, BROKER_READ_TOOL],
             )
 
             reply = self._extract_text(response)
@@ -365,6 +366,6 @@ class TradingAdvisorAgent(BaseAgent):
             )
         if name == "market_data":
             return execute_market_data(**input)
-        if name == "alpaca_account":
-            return execute_alpaca_read_tool(**input)
+        if name == "broker_account":
+            return execute_broker_read_tool(**input)
         return super()._execute_tool(name, input)

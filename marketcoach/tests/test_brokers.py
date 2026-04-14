@@ -1,0 +1,175 @@
+"""
+Tests for the broker abstraction layer.
+
+Three layers:
+  1. Factory selection — alpaca/ibkr/unknown picks the right class
+  2. AlpacaBroker behaviour — disconnected stubs, paper guard
+  3. IBKRBroker behaviour — disconnected stubs, paper guard, mocked ib_insync
+
+We never hit a real Alpaca or IBKR API. Tests run on a developer machine
+that may not have ib_insync installed at all.
+"""
+
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from backend.brokers import BrokerClient, OrderResult, get_broker, init_broker
+from backend.brokers.alpaca import AlpacaBroker
+from backend.brokers.factory import reset_broker
+from backend.brokers.ibkr import IBKRBroker
+
+
+@pytest.fixture(autouse=True)
+def _clean_singleton():
+    reset_broker()
+    yield
+    reset_broker()
+
+
+# ── Factory ────────────────────────────────────────────────────────────────
+
+class TestBrokerFactory:
+    def test_init_alpaca_returns_alpaca_instance(self):
+        broker = init_broker("alpaca", api_key="", secret_key="", paper=True)
+        assert isinstance(broker, AlpacaBroker)
+        assert get_broker() is broker
+
+    def test_init_ibkr_returns_ibkr_instance(self):
+        broker = init_broker("ibkr", host="127.0.0.1", port=7497, client_id=1)
+        assert isinstance(broker, IBKRBroker)
+        assert get_broker() is broker
+
+    def test_unknown_provider_falls_back_to_alpaca(self):
+        broker = init_broker("garbage", api_key="", secret_key="")
+        assert isinstance(broker, AlpacaBroker)
+
+    def test_provider_name_case_insensitive(self):
+        broker = init_broker("IBKR", host="127.0.0.1", port=7497)
+        assert isinstance(broker, IBKRBroker)
+
+    def test_get_broker_returns_none_before_init(self):
+        # _clean_singleton resets it
+        assert get_broker() is None
+
+    def test_init_replaces_singleton(self):
+        a = init_broker("alpaca", api_key="", secret_key="")
+        b = init_broker("ibkr", host="127.0.0.1", port=7497)
+        assert get_broker() is b
+        assert get_broker() is not a
+
+
+# ── AlpacaBroker ───────────────────────────────────────────────────────────
+
+class TestAlpacaBroker:
+    def test_disconnected_when_no_credentials(self):
+        b = AlpacaBroker(api_key="", secret_key="", paper=True)
+        assert b.is_connected() is False
+        assert b.get_account()["status"] == "disconnected"
+        assert b.get_positions() == []
+        assert b.get_order_history() == []
+
+    def test_implements_abstract_interface(self):
+        b = AlpacaBroker()
+        assert isinstance(b, BrokerClient)
+
+    def test_paper_guard_on_place_order(self):
+        """place_order with paper_only=False AND paper=False must raise."""
+        b = AlpacaBroker(api_key="", secret_key="", paper=False)
+        with pytest.raises(ValueError, match="Live trading"):
+            b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=False)
+
+    def test_disconnected_place_order_returns_error_result(self):
+        b = AlpacaBroker(api_key="", secret_key="", paper=True)
+        result = b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=True)
+        assert isinstance(result, OrderResult)
+        assert result.status == "error_disconnected"
+        assert result.is_paper is True
+
+
+# ── IBKRBroker ─────────────────────────────────────────────────────────────
+
+class TestIBKRBroker:
+    def test_disconnected_returns_disconnected_status(self):
+        """No IB Gateway → is_connected False, get_account returns the
+        actionable error message that tells the user how to fix it."""
+        b = IBKRBroker(host="127.0.0.1", port=7497, client_id=1, paper=True)
+        # _ensure_connected will fail (no Gateway running, ib_insync may not
+        # even be installed). is_connected() should return False without raising.
+        assert b.is_connected() is False
+        account = b.get_account()
+        assert account["status"] == "disconnected"
+        assert "ib gateway" in account["message"].lower()
+
+    def test_implements_abstract_interface(self):
+        b = IBKRBroker()
+        assert isinstance(b, BrokerClient)
+
+    def test_paper_guard_on_place_order(self):
+        b = IBKRBroker(paper=False)
+        with pytest.raises(ValueError, match="Live trading"):
+            b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=False)
+
+    def test_get_positions_no_gateway(self):
+        b = IBKRBroker()
+        assert b.get_positions() == []
+
+    def test_get_order_history_no_gateway(self):
+        b = IBKRBroker()
+        assert b.get_order_history() == []
+
+    def test_close_position_no_gateway(self):
+        b = IBKRBroker()
+        result = b.close_position("NVDA")
+        assert "error" in result
+
+    def test_place_order_with_mocked_ib_insync(self):
+        """
+        Build an IBKRBroker, inject a mocked ib_insync IB instance, and verify
+        the place_order path calls into it with the expected shape.
+
+        This tests the *vendor-neutral conversion* — we verify that the
+        IBKRBroker correctly maps trade.orderStatus into an OrderResult
+        without hitting a real IB Gateway.
+        """
+        b = IBKRBroker(paper=True)
+
+        # Build a fake trade object that looks like ib_insync's Trade
+        fake_order = SimpleNamespace(permId=12345, orderId=1)
+        fake_status = SimpleNamespace(status="Filled", avgFillPrice=450.12)
+        fake_trade = SimpleNamespace(
+            order=fake_order,
+            orderStatus=fake_status,
+            log=[],
+        )
+
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.qualifyContracts.return_value = []
+        fake_ib.placeOrder.return_value = fake_trade
+
+        b._ib = fake_ib  # bypass _ensure_connected by pre-injecting
+
+        # Patch the lazy ib_insync imports at module level so place_order
+        # finds Stock and MarketOrder when it tries to import them
+        fake_module = MagicMock()
+        fake_module.Stock = MagicMock(return_value=SimpleNamespace(symbol="NVDA"))
+        fake_module.MarketOrder = MagicMock(return_value=fake_order)
+
+        with patch.dict(sys.modules, {"ib_insync": fake_module}):
+            result = b.place_order(
+                ticker="NVDA", qty=10, side="buy", paper_only=True
+            )
+
+        assert isinstance(result, OrderResult)
+        assert result.order_id == "12345"
+        assert result.ticker == "NVDA"
+        assert result.qty == 10
+        assert result.side == "buy"
+        assert result.status == "filled"
+        assert result.fill_price == 450.12
+        assert result.is_paper is True
+        # Verify the IBKR client was actually called
+        fake_ib.placeOrder.assert_called_once()

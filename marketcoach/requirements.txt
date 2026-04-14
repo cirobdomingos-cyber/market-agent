@@ -11,6 +11,11 @@ ddgs>=7.0.0
 yfinance>=0.2.0
 alpaca-py>=0.30.0
 
+# Interactive Brokers — only needed when BROKER_PROVIDER=ibkr.
+# The ibkr broker module imports this lazily so it's safe to skip if you
+# stay on Alpaca. Also requires running IB Gateway locally.
+ib_insync>=0.9.86
+
 # Testing
 pytest>=8.0.0
 httpx>=0.27.0
