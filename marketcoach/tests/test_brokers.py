@@ -130,10 +130,15 @@ class TestIBKRBroker:
         Build an IBKRBroker, inject a mocked ib_insync IB instance, and verify
         the place_order path calls into it with the expected shape.
 
-        This tests the *vendor-neutral conversion* — we verify that the
-        IBKRBroker correctly maps trade.orderStatus into an OrderResult
-        without hitting a real IB Gateway.
+        Note on threading: ib_insync's thread-affinity issues forced us to
+        run every operation on a dedicated background thread that owns the
+        event loop. The broker methods submit coroutines via
+        run_coroutine_threadsafe. For tests we can use the real broker loop
+        (it's a module-level singleton) and inject an AsyncMock-shaped IB
+        instance that supports `await`ing its async methods.
         """
+        from unittest.mock import AsyncMock
+
         b = IBKRBroker(paper=True)
 
         # Build a fake trade object that looks like ib_insync's Trade
@@ -145,20 +150,20 @@ class TestIBKRBroker:
             log=[],
         )
 
+        # The IB mock needs async methods (qualifyContractsAsync) that can
+        # actually be awaited, plus sync methods (placeOrder, isConnected)
+        # that return values directly.
         fake_ib = MagicMock()
         fake_ib.isConnected.return_value = True
-        fake_ib.qualifyContracts.return_value = []
-        fake_ib.placeOrder.return_value = fake_trade
+        fake_ib.qualifyContractsAsync = AsyncMock(return_value=[])
+        fake_ib.placeOrder = MagicMock(return_value=fake_trade)
 
         b._ib = fake_ib  # bypass _ensure_connected by pre-injecting
 
-        # Patch the lazy ib_insync imports at module level so place_order
-        # finds Stock and MarketOrder when it tries to import them
-        fake_module = MagicMock()
-        fake_module.Stock = MagicMock(return_value=SimpleNamespace(symbol="NVDA"))
-        fake_module.MarketOrder = MagicMock(return_value=fake_order)
-
-        with patch.dict(sys.modules, {"ib_insync": fake_module}):
+        # Patch the module-level _Stock / _MarketOrder constants so the
+        # broker's internal calls resolve to something harmless
+        with patch("backend.brokers.ibkr._Stock", return_value=SimpleNamespace(symbol="NVDA")), \
+             patch("backend.brokers.ibkr._MarketOrder", return_value=fake_order):
             result = b.place_order(
                 ticker="NVDA", qty=10, side="buy", paper_only=True
             )
@@ -173,3 +178,4 @@ class TestIBKRBroker:
         assert result.is_paper is True
         # Verify the IBKR client was actually called
         fake_ib.placeOrder.assert_called_once()
+        fake_ib.qualifyContractsAsync.assert_awaited_once()

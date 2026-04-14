@@ -8,34 +8,43 @@ Why IBKR:
   with a single settings flag — no agent or endpoint code changes needed.
 
 How IBKR is different from Alpaca:
-  - IBKR talks via a TCP socket to a local "IB Gateway" or TWS process,
-    NOT over HTTPS. You must run IB Gateway (a Java app) on the same
-    machine as this backend, logged into your account.
-  - The official ibapi library is callback-based and painful. We use
-    ib_insync, the community wrapper that gives us a clean sync/async API.
-  - Paper vs live is decided by which IBKR account you log Gateway into.
-    Same code, different login. Default paper port is 7497, live is 7496.
-  - Order objects, Position objects, and AccountSummary use IBKR-specific
-    field names. Everything is normalised to vendor-neutral dicts here so
-    the rest of the codebase doesn't notice.
+  - IBKR talks via a TCP socket to a local IB Gateway (or TWS) process,
+    NOT over HTTPS. You must run Gateway on the same machine, logged in.
+  - The official ibapi library is callback-based. We use ib_insync, which
+    wraps it in a clean sync/async API.
+  - Paper vs live is decided by which Gateway login you use. Same code,
+    different login. Gateway 10+ ports: 4002 = paper, 4001 = live.
+    (Older IB Gateway / TWS uses 7497 paper / 7496 live.)
 
-Setup the user does (one-time, after IBKR account is open):
-  1. Install IB Gateway from interactivebrokers.com
-  2. Log in with paper credentials (you get them automatically with a
-     funded Pro account) on port 7497, OR live credentials on port 7496
-  3. Enable "ActiveX and Socket Clients" in Gateway → Configure → API
-  4. Add 127.0.0.1 to "Trusted IPs"
-  5. pip install ib_insync
-  6. Set IBKR_HOST=127.0.0.1, IBKR_PORT=7497 (paper) or 7496 (live),
-     IBKR_CLIENT_ID=1 in .env
-  7. Set BROKER_PROVIDER=ibkr in .env
-  8. Restart MarketCoach
+Threading model — the tricky part
+---------------------------------
+ib_insync is fundamentally single-threaded. The IB() client maintains
+async state (reader/writer tasks, callback queues, nest_asyncio glue) that
+is bound to the event loop that was running when `ib.connect()` was called.
+Calling any ib.* method from a DIFFERENT thread sends the request on the
+socket but the response callback is scheduled on the original thread's
+loop, so the caller waits forever for a result that never arrives on the
+current thread.
 
-The ib_insync import is deferred until first use so the package isn't
-required at startup — users who stay on Alpaca don't need to install it.
+FastAPI's sync endpoints run in an anyio threadpool — every request may
+land in a different worker thread. The first /portfolio call connected
+on thread A and worked. The next call landed on thread B, tried to use
+the same IB client, and hung inside placeOrder's sleep(1) waiting for a
+fill callback that was being delivered to A's loop.
+
+Fix: run ALL ib_insync operations on a single dedicated background thread
+that owns the event loop. FastAPI worker threads submit coroutines via
+asyncio.run_coroutine_threadsafe and block on the resulting Future. This
+is the canonical pattern for integrating blocking sync code with an async
+library that assumes single-threaded ownership.
+
+Cost: all IB operations serialize through one thread. For a personal
+trading account with a handful of operations per minute that's a non-issue.
+For a high-frequency system it would be a bottleneck, but we aren't one.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
 from typing import Optional
@@ -48,16 +57,9 @@ logger = logging.getLogger(__name__)
 # ── ib_insync import at module load time ────────────────────────────────────
 #
 # The eventkit library (ib_insync's dependency) calls asyncio.get_event_loop()
-# at import time to cache a "main" loop. That call works on the main thread
-# (where FastAPI's lifespan runs) but fails with "no current event loop in
-# thread" when triggered lazily from a FastAPI worker thread.
-#
-# Fix: import ib_insync once at module load time. This module is imported
-# during init_broker("ibkr", ...) which runs inside the async lifespan on
-# the main thread, so get_event_loop() finds a real loop.
-#
-# We still tolerate ib_insync being missing (ImportError → set sentinel)
-# so that tests and the Alpaca-only path don't need the package installed.
+# at import time to cache a "main" loop. Importing lazily from a worker
+# thread raises "no current event loop". We import here so the init runs on
+# the main thread during FastAPI startup, where a loop exists.
 
 try:
     from ib_insync import IB as _IB
@@ -72,31 +74,85 @@ except ImportError:  # pragma: no cover — graceful degradation
     logger.debug("ib_insync not installed — IBKR broker will refuse connections")
 
 
-def _ensure_thread_event_loop() -> None:
-    """
-    FastAPI sync endpoints run in worker threads with no default event loop.
-    ib_insync's sync shims (ib.connect, ib.placeOrder, etc.) need a loop in
-    the current thread to run the underlying async operations on. Create a
-    fresh loop for the thread if there isn't one — safe no-op when there is.
-    """
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        # "There is no current event loop in thread '...'"
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+# ── Dedicated broker thread + event loop ────────────────────────────────────
+#
+# Module-level singletons. The first call to `_get_broker_loop()` starts a
+# daemon thread that creates its own event loop and runs it forever. All
+# subsequent ib_insync operations are submitted to this loop via
+# `asyncio.run_coroutine_threadsafe` from whatever FastAPI worker thread
+# happens to be handling the request.
+#
+# The loop is created eagerly (so ib_insync's nest_asyncio tricks have a
+# stable environment) but the IBKRBroker.connect happens later when the
+# first /portfolio call fires. That keeps startup fast and means a bad
+# IBKR config doesn't crash the backend at boot.
 
+_broker_thread: Optional[threading.Thread] = None
+_broker_loop: Optional[asyncio.AbstractEventLoop] = None
+_broker_thread_lock = threading.Lock()
+
+
+def _get_broker_loop() -> asyncio.AbstractEventLoop:
+    """Return the shared broker event loop, starting the thread on first call."""
+    global _broker_thread, _broker_loop
+    with _broker_thread_lock:
+        if _broker_loop is not None and _broker_thread is not None and _broker_thread.is_alive():
+            return _broker_loop
+
+        loop = asyncio.new_event_loop()
+
+        def _run_loop():
+            # This thread owns the loop forever. Every ib_insync op is
+            # scheduled on it via run_coroutine_threadsafe from elsewhere.
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_forever()
+            finally:
+                # Graceful shutdown — cancel pending tasks, then close.
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+                loop.close()
+
+        thread = threading.Thread(
+            target=_run_loop,
+            daemon=True,
+            name="ibkr-broker-loop",
+        )
+        thread.start()
+        _broker_thread = thread
+        _broker_loop = loop
+        logger.info("IBKR broker loop started on dedicated thread")
+        return loop
+
+
+def _run_on_broker_loop(coro, timeout: float = 30.0):
+    """
+    Submit a coroutine to the broker loop's thread and block until done.
+
+    Args:
+        coro: an `async def` coroutine that uses ib_insync's async variants
+        timeout: seconds to wait before giving up
+
+    Raises:
+        concurrent.futures.TimeoutError if the call takes longer than timeout
+        Any exception raised inside the coroutine is re-raised here
+    """
+    loop = _get_broker_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=timeout)
+
+
+# ── Broker class ────────────────────────────────────────────────────────────
 
 class IBKRBroker(BrokerClient):
     """
-    Interactive Brokers client via ib_insync.
-
-    The connection is opened lazily on the first call so:
-      - Importing this module never blocks on a network round-trip
-      - The module loads even when ib_insync isn't installed (the import
-        only fires when you actually try to use it)
-      - Tests can construct an instance and stub _ib without installing
-        the real package
+    Interactive Brokers client via ib_insync, running all ops on a dedicated
+    background thread to avoid the thread-affinity issues that would otherwise
+    break every call after the first.
     """
 
     def __init__(
@@ -110,23 +166,17 @@ class IBKRBroker(BrokerClient):
         self.port = port
         self.client_id = client_id
         self.paper = paper
-        self._ib = None  # lazy-initialised IB instance from ib_insync
+        self._ib = None  # the shared IB() instance, created on first connect
+        self._connect_lock = threading.Lock()
+
+    # ── Connection lifecycle ────────────────────────────────────────────────
 
     def _ensure_connected(self) -> bool:
-        """Connect to IB Gateway on first use. Returns False on any failure."""
-        # FastAPI's sync endpoints run in a threadpool — every request may
-        # land in a different worker thread. ib_insync's sync shims need an
-        # event loop in the current thread to drive the async internals, and
-        # this must happen on EVERY call, not just on the initial connect.
-        # The first /portfolio call connected on thread A, a subsequent call
-        # on thread B failed with "no current event loop in thread" because
-        # this setup ran only on the connect path. Move it to the top so
-        # every method benefits.
-        _ensure_thread_event_loop()
-
-        if self._ib is not None and self._ib.isConnected():
-            return True
-
+        """
+        Connect to IB Gateway on first use. Idempotent: subsequent calls just
+        verify the existing connection is still live. All the ib_insync work
+        happens on the broker loop thread.
+        """
         if not _IBKR_AVAILABLE:
             logger.warning(
                 "ib_insync not installed — install with `pip install ib_insync` "
@@ -134,23 +184,34 @@ class IBKRBroker(BrokerClient):
             )
             return False
 
-        try:
-            ib = _IB()
-            ib.connect(self.host, self.port, clientId=self.client_id, timeout=5)
-            self._ib = ib
-            logger.info(
-                "IBKR broker connected to %s:%d clientId=%d (paper=%s)",
-                self.host, self.port, self.client_id, self.paper,
-            )
-            return True
-        except Exception as exc:
-            logger.warning("IBKR connection failed: %s", exc)
-            return False
+        with self._connect_lock:
+            if self._ib is not None and self._ib.isConnected():
+                return True
+
+            async def _do_connect():
+                ib = _IB()
+                await ib.connectAsync(
+                    self.host,
+                    self.port,
+                    clientId=self.client_id,
+                    timeout=10,
+                )
+                return ib
+
+            try:
+                self._ib = _run_on_broker_loop(_do_connect(), timeout=15.0)
+                logger.info(
+                    "IBKR broker connected to %s:%d clientId=%d (paper=%s)",
+                    self.host, self.port, self.client_id, self.paper,
+                )
+                return True
+            except Exception as exc:
+                logger.warning("IBKR connection failed: %s", exc)
+                return False
 
     def is_connected(self) -> bool:
-        # Called from /health in a worker thread — needs a loop in case
-        # ib_insync's isConnected() touches anything loop-dependent.
-        _ensure_thread_event_loop()
+        # Cheap check — reads a boolean attribute on the IB instance.
+        # Doesn't need to cross the loop boundary.
         return self._ib is not None and self._ib.isConnected()
 
     # ── Read operations ──────────────────────────────────────────────────────
@@ -165,9 +226,13 @@ class IBKRBroker(BrokerClient):
                 ),
             }
 
+        async def _do():
+            # reqAccountSummaryAsync returns AccountValue rows keyed by tag
+            rows = await self._ib.accountSummaryAsync()
+            return rows
+
         try:
-            # accountSummary returns a list of AccountValue objects keyed by tag
-            summary = self._ib.accountSummary()
+            summary = _run_on_broker_loop(_do(), timeout=10.0)
             tags = {row.tag: row for row in summary}
 
             def _f(tag: str, default: float = 0.0) -> float:
@@ -180,7 +245,6 @@ class IBKRBroker(BrokerClient):
                     return default
 
             return {
-                # Map IBKR account-summary tags to the vendor-neutral schema
                 "equity": _f("NetLiquidation"),
                 "buying_power": _f("BuyingPower"),
                 "cash": _f("TotalCashValue"),
@@ -195,36 +259,28 @@ class IBKRBroker(BrokerClient):
         if not self._ensure_connected():
             return []
 
+        async def _do():
+            positions = await self._ib.reqPositionsAsync()
+            return list(positions)
+
         try:
-            positions = self._ib.positions()
+            positions = _run_on_broker_loop(_do(), timeout=10.0)
             results = []
             for p in positions:
                 qty = float(p.position)
                 avg_entry = float(p.avgCost)
-                # Current price requires a market-data subscription — best-effort
-                current = None
-                try:
-                    ticker = self._ib.reqMktData(p.contract, snapshot=True)
-                    self._ib.sleep(0.5)  # let the snapshot arrive
-                    if ticker.last and ticker.last == ticker.last:  # not NaN
-                        current = float(ticker.last)
-                except Exception:
-                    pass
-
-                pnl = (current - avg_entry) * qty if current else None
-                pnl_pct = (
-                    ((current - avg_entry) / avg_entry) * 100
-                    if current and avg_entry
-                    else None
-                )
-
+                # Current price requires a market-data subscription. Fetching
+                # a snapshot across the loop boundary is slow and noisy on
+                # paper accounts without a real-time subscription — skip it
+                # here and let the market_data tool (yfinance) provide prices
+                # when the frontend needs them.
                 results.append({
                     "ticker": p.contract.symbol,
                     "qty": qty,
                     "avg_entry": avg_entry,
-                    "current_price": current,
-                    "unrealised_pnl": pnl,
-                    "unrealised_pnl_pct": pnl_pct,
+                    "current_price": None,
+                    "unrealised_pnl": None,
+                    "unrealised_pnl_pct": None,
                 })
             return results
         except Exception as exc:
@@ -235,9 +291,13 @@ class IBKRBroker(BrokerClient):
         if not self._ensure_connected():
             return []
 
+        async def _do():
+            # trades() is a synchronous list accessor on IB — cheap.
+            # Wrap in async so it runs on the broker loop.
+            return list(self._ib.trades())[-limit:]
+
         try:
-            # Trades = orders + executions, filled or otherwise
-            trades = self._ib.trades()[-limit:]
+            trades = _run_on_broker_loop(_do(), timeout=5.0)
             results = []
             for t in trades:
                 order = t.order
@@ -251,10 +311,7 @@ class IBKRBroker(BrokerClient):
                     if t.orderStatus and t.orderStatus.avgFillPrice
                     else None
                 )
-                # Take submission/fill timestamps from the trade log if present
-                submitted_at = (
-                    str(t.log[0].time) if t.log else ""
-                )
+                submitted_at = str(t.log[0].time) if t.log else ""
                 filled_at = None
                 for entry in t.log:
                     if entry.status == "Filled":
@@ -303,19 +360,23 @@ class IBKRBroker(BrokerClient):
                 is_paper=self.paper,
             )
 
-        try:
+        async def _do():
             contract = _Stock(ticker, "SMART", "USD")
-            self._ib.qualifyContracts(contract)
-
+            await self._ib.qualifyContractsAsync(contract)
             order = _MarketOrder(
                 action="BUY" if side == "buy" else "SELL",
                 totalQuantity=qty,
             )
             trade = self._ib.placeOrder(contract, order)
+            # Wait briefly for the order status to populate — paper fills
+            # usually arrive within <1s. Use asyncio.sleep on the broker loop
+            # instead of ib.sleep() which is a sync wrapper that confuses
+            # nest_asyncio when called via run_coroutine_threadsafe.
+            await asyncio.sleep(2.0)
+            return trade
 
-            # Wait briefly for the order to acknowledge / fill (paper fills
-            # are usually instant; live can vary)
-            self._ib.sleep(1)
+        try:
+            trade = _run_on_broker_loop(_do(), timeout=15.0)
 
             status = trade.orderStatus.status if trade.orderStatus else "Submitted"
             avg_fill = (
@@ -325,8 +386,8 @@ class IBKRBroker(BrokerClient):
             )
 
             logger.info(
-                "IBKR order submitted: %s %s x%.2f → %s (paper=%s)",
-                side.upper(), ticker, qty, status, self.paper,
+                "IBKR order submitted: %s %s x%.2f → %s (paper=%s, fill=%s)",
+                side.upper(), ticker, qty, status, self.paper, avg_fill,
             )
 
             return OrderResult(
@@ -353,29 +414,35 @@ class IBKRBroker(BrokerClient):
         if not self._ensure_connected():
             return {"error": "IBKR not configured"}
 
-        try:
-            # Find the open position for this ticker
+        async def _do():
+            positions = await self._ib.reqPositionsAsync()
             target = None
-            for p in self._ib.positions():
+            for p in positions:
                 if p.contract.symbol == ticker and p.position != 0:
                     target = p
                     break
             if target is None:
-                return {"error": f"No open position for {ticker}", "ticker": ticker}
+                return None  # signals "no position" to the sync caller
 
             qty = abs(float(target.position))
             side = "SELL" if target.position > 0 else "BUY"
-
             contract = _Stock(ticker, "SMART", "USD")
-            self._ib.qualifyContracts(contract)
+            await self._ib.qualifyContractsAsync(contract)
             order = _MarketOrder(action=side, totalQuantity=qty)
             trade = self._ib.placeOrder(contract, order)
-            self._ib.sleep(1)
+            await asyncio.sleep(2.0)
+            return trade, side
+
+        try:
+            result = _run_on_broker_loop(_do(), timeout=15.0)
+            if result is None:
+                return {"error": f"No open position for {ticker}", "ticker": ticker}
+            trade, side = result
 
             status = trade.orderStatus.status if trade.orderStatus else "Submitted"
             logger.info(
-                "IBKR closed position: %s qty=%.2f side=%s status=%s (paper=%s)",
-                ticker, qty, side, status, self.paper,
+                "IBKR closed position: %s side=%s status=%s (paper=%s)",
+                ticker, side, status, self.paper,
             )
             return {
                 "order_id": str(trade.order.permId or trade.order.orderId),
