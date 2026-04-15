@@ -373,7 +373,13 @@ class IBKRBroker(BrokerClient):
         qty: float,
         side: str,
         paper_only: bool = True,
+        order_type: str = "market",
+        limit_price: Optional[float] = None,
     ) -> OrderResult:
+        if order_type not in ("market", "limit"):
+            raise ValueError(f"order_type must be 'market' or 'limit', got {order_type!r}")
+        if order_type == "limit" and limit_price is None:
+            raise ValueError("limit_price is required when order_type='limit'")
         if not paper_only and not self.paper:
             raise ValueError(
                 "Live trading requires explicit user confirmation. "
@@ -393,10 +399,18 @@ class IBKRBroker(BrokerClient):
         async def _do():
             contract = _Stock(ticker, "SMART", "USD")
             await self._ib.qualifyContractsAsync(contract)
-            order = _MarketOrder(
-                action="BUY" if side == "buy" else "SELL",
-                totalQuantity=qty,
-            )
+            action = "BUY" if side == "buy" else "SELL"
+            if order_type == "limit":
+                order = _LimitOrder(
+                    action=action,
+                    totalQuantity=qty,
+                    lmtPrice=limit_price,
+                )
+            else:
+                order = _MarketOrder(
+                    action=action,
+                    totalQuantity=qty,
+                )
             trade = self._ib.placeOrder(contract, order)
             # Wait briefly for the order status to populate — paper fills
             # usually arrive within <1s. Use asyncio.sleep on the broker loop

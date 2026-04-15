@@ -126,7 +126,13 @@ class AlpacaBroker(BrokerClient):
         qty: float,
         side: str,
         paper_only: bool = True,
+        order_type: str = "market",
+        limit_price: Optional[float] = None,
     ) -> OrderResult:
+        if order_type not in ("market", "limit"):
+            raise ValueError(f"order_type must be 'market' or 'limit', got {order_type!r}")
+        if order_type == "limit" and limit_price is None:
+            raise ValueError("limit_price is required when order_type='limit'")
         if not paper_only and not self.paper:
             raise ValueError(
                 "Live trading requires explicit user confirmation. "
@@ -143,15 +149,25 @@ class AlpacaBroker(BrokerClient):
             )
 
         try:
-            from alpaca.trading.requests import MarketOrderRequest
+            from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
             from alpaca.trading.enums import OrderSide, TimeInForce
 
-            request = MarketOrderRequest(
-                symbol=ticker,
-                qty=qty,
-                side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
-            )
+            alpaca_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+            if order_type == "limit":
+                request = LimitOrderRequest(
+                    symbol=ticker,
+                    qty=qty,
+                    side=alpaca_side,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price,
+                )
+            else:
+                request = MarketOrderRequest(
+                    symbol=ticker,
+                    qty=qty,
+                    side=alpaca_side,
+                    time_in_force=TimeInForce.DAY,
+                )
             order = self._client.submit_order(request)
 
             logger.info(

@@ -1051,6 +1051,8 @@ def confirm_order(
                 qty=request.qty,
                 side=request.side,
                 paper_only=not settings.is_live_mode,
+                order_type=request.order_type,
+                limit_price=request.limit_price,
             )
     except Exception as exc:
         logger.exception("Broker order placement failed for %s", request.ticker)

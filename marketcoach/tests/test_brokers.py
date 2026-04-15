@@ -88,6 +88,28 @@ class TestAlpacaBroker:
         assert result.status == "error_disconnected"
         assert result.is_paper is True
 
+    def test_place_order_rejects_limit_without_price(self):
+        b = AlpacaBroker(api_key="", secret_key="", paper=True)
+        with pytest.raises(ValueError, match="limit_price is required"):
+            b.place_order(
+                ticker="NVDA",
+                qty=1,
+                side="buy",
+                paper_only=True,
+                order_type="limit",
+            )
+
+    def test_place_order_rejects_unknown_order_type(self):
+        b = AlpacaBroker(api_key="", secret_key="", paper=True)
+        with pytest.raises(ValueError, match="order_type must be"):
+            b.place_order(
+                ticker="NVDA",
+                qty=1,
+                side="buy",
+                paper_only=True,
+                order_type="stop",
+            )
+
 
 # ── IBKRBroker ─────────────────────────────────────────────────────────────
 
@@ -111,6 +133,17 @@ class TestIBKRBroker:
         b = IBKRBroker(paper=False)
         with pytest.raises(ValueError, match="Live trading"):
             b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=False)
+
+    def test_place_order_rejects_limit_without_price(self):
+        b = IBKRBroker(paper=True)
+        with pytest.raises(ValueError, match="limit_price is required"):
+            b.place_order(
+                ticker="NVDA",
+                qty=1,
+                side="buy",
+                paper_only=True,
+                order_type="limit",
+            )
 
     def test_get_positions_no_gateway(self):
         b = IBKRBroker()
@@ -179,3 +212,45 @@ class TestIBKRBroker:
         # Verify the IBKR client was actually called
         fake_ib.placeOrder.assert_called_once()
         fake_ib.qualifyContractsAsync.assert_awaited_once()
+
+    def test_place_order_limit_path_calls_limit_order(self):
+        """
+        Non-bracket limit orders MUST construct _LimitOrder(lmtPrice=...),
+        not _MarketOrder. Regression guard for the silent-market-downgrade
+        bug the HANDOFF flagged as pre-live blocker.
+        """
+        from unittest.mock import AsyncMock
+
+        b = IBKRBroker(paper=True)
+
+        fake_order = SimpleNamespace(permId=99999, orderId=2)
+        fake_status = SimpleNamespace(status="Submitted", avgFillPrice=None)
+        fake_trade = SimpleNamespace(order=fake_order, orderStatus=fake_status, log=[])
+
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.qualifyContractsAsync = AsyncMock(return_value=[])
+        fake_ib.placeOrder = MagicMock(return_value=fake_trade)
+        b._ib = fake_ib
+
+        limit_order_mock = MagicMock(return_value=fake_order)
+        market_order_mock = MagicMock(return_value=fake_order)
+
+        with patch("backend.brokers.ibkr._Stock", return_value=SimpleNamespace(symbol="NVDA")), \
+             patch("backend.brokers.ibkr._LimitOrder", limit_order_mock), \
+             patch("backend.brokers.ibkr._MarketOrder", market_order_mock):
+            result = b.place_order(
+                ticker="NVDA",
+                qty=5,
+                side="buy",
+                paper_only=True,
+                order_type="limit",
+                limit_price=123.45,
+            )
+
+        assert isinstance(result, OrderResult)
+        assert result.status == "submitted"
+        limit_order_mock.assert_called_once_with(
+            action="BUY", totalQuantity=5, lmtPrice=123.45
+        )
+        market_order_mock.assert_not_called()

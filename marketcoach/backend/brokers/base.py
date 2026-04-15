@@ -92,12 +92,19 @@ class BrokerClient(ABC):
         qty: float,
         side: str,
         paper_only: bool = True,
+        order_type: str = "market",
+        limit_price: Optional[float] = None,
     ) -> OrderResult:
         """
-        Submit a market order. paper_only is a runtime safety check — when
-        True, implementations MUST refuse to submit if their connection is
-        not in paper mode. Defence in depth: even if our /orders/confirm
+        Submit a market or limit order. paper_only is a runtime safety check —
+        when True, implementations MUST refuse to submit if their connection
+        is not in paper mode. Defence in depth: even if our /orders/confirm
         endpoint loses its mind, the broker layer enforces the paper rule.
+
+        order_type is "market" (default) or "limit". When "limit", limit_price
+        must be provided; implementations raise ValueError otherwise. Limit
+        orders are DAY TIF — if not filled by close, they cancel. For GTC
+        behaviour use place_bracket_order.
         """
 
     @abstractmethod
