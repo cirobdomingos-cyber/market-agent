@@ -124,6 +124,12 @@ async def lifespan(app: FastAPI):
             client_id=settings.ibkr_client_id,
             paper=not is_live,
         )
+    elif provider == "none":
+        # Explicit opt-out — used when the backend runs somewhere it can't
+        # reach a broker (cloud-hosted analysis service, test environment,
+        # etc.). Analysis features work normally; trading endpoints return
+        # "disconnected". Factory logs its own info line when this hits.
+        init_broker("none")
     else:
         logger.warning(
             "Unknown BROKER_PROVIDER='%s'. Broker features disabled.",
@@ -631,11 +637,11 @@ def get_chat_history(session_id: str, db: Session = Depends(get_db)):
 
 @app.get("/portfolio")
 def get_portfolio(_auth: str = Depends(require_auth)):
-    """Return paper positions and account summary from Alpaca."""
+    """Return positions and account summary from the active broker."""
     client = get_broker()
     if client is None:
         return {
-            "account": {"status": "disconnected", "message": "Alpaca not configured"},
+            "account": {"status": "disconnected", "message": "Broker not configured"},
             "positions": [],
         }
     return {
@@ -792,7 +798,7 @@ def get_order_history(
     limit: int = Query(default=20, ge=1, le=100),
     _auth: str = Depends(require_auth),
 ):
-    """Return recent order history from Alpaca."""
+    """Return recent order history from the active broker."""
     client = get_broker()
     if client is None:
         return []
@@ -801,10 +807,10 @@ def get_order_history(
 
 # -- Order execution -----------------------------------------------------------
 #
-# Defence in depth — every layer must allow the order before it reaches Alpaca:
+# Defence in depth — every layer must allow the order before it reaches the broker:
 #   1. Pydantic schema  (in OrderConfirmRequest)
 #   2. Live mode gate   (settings.is_live_mode → confirm_live_capital must be True)
-#   3. Alpaca connected (no-op if client missing)
+#   3. Broker connected (no-op if client missing)
 #   4. Daily order cap  (max N orders per 24h, prevents runaway)
 #   5. Ticker whitelist (must be a position, open thesis, or watchlist ticker)
 #   6. 20% rule         (order notional ≤ 20% of portfolio value)
@@ -930,12 +936,17 @@ def confirm_order(
             ),
         )
 
-    # Gate 3 — Alpaca must be connected
+    # Gate 3 — broker must be connected
     client = get_broker()
     if client is None:
         raise HTTPException(
             status_code=503,
-            detail="Alpaca client not configured. Set ALPACA_API_KEY and ALPACA_SECRET_KEY.",
+            detail=(
+                "Broker not configured. For Alpaca, set ALPACA_API_KEY and "
+                "ALPACA_SECRET_KEY. For IBKR, start IB Gateway and set "
+                "BROKER_PROVIDER=ibkr. This environment may be running with "
+                "BROKER_PROVIDER=none (trading disabled)."
+            ),
         )
 
     # Gate 4 — daily order cap

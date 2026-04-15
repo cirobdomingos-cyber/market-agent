@@ -8,7 +8,14 @@ called from everywhere else (orchestrator, /orders/confirm, agent tools).
 Selection rules:
   - settings.broker_provider == "alpaca" → AlpacaBroker (default)
   - settings.broker_provider == "ibkr"   → IBKRBroker
+  - settings.broker_provider == "none"   → no broker, get_broker() returns None
   - Anything else                        → log warning, fall back to Alpaca
+
+The "none" provider exists so the backend can run in environments that
+cannot reach a broker at all (e.g. a cloud-hosted analysis service with
+IB Gateway staying local). Every call site already short-circuits on
+get_broker() is None, so the analysis features keep working while the
+trading endpoints return clean "disconnected" responses.
 
 We deliberately do NOT import the broker classes at module load so that
 neither alpaca-py nor ib_insync needs to be installed when the other
@@ -39,6 +46,14 @@ def init_broker(provider: str, **kwargs) -> Optional[BrokerClient]:
     global _broker_instance
 
     provider = (provider or "alpaca").lower().strip()
+
+    if provider == "none":
+        _broker_instance = None
+        logger.info(
+            "Broker provider='none' — broker features disabled. "
+            "Trading endpoints will return 'disconnected'; analysis features work normally."
+        )
+        return None
 
     if provider == "alpaca":
         from backend.brokers.alpaca import AlpacaBroker

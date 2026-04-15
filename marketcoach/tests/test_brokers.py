@@ -29,6 +29,43 @@ def _clean_singleton():
     reset_broker()
 
 
+class TestBrokerFactoryNone:
+    """
+    BROKER_PROVIDER=none is the explicit "no broker" option used when the
+    backend runs somewhere it can't reach a broker (cloud-hosted analysis,
+    test environments). Every call site already short-circuits on
+    get_broker() returning None; the "none" provider is just the clean way
+    to opt in to that state without construction attempts or connection
+    timeouts.
+    """
+
+    def test_none_provider_returns_none_and_singleton_is_none(self):
+        from backend.brokers import get_broker, init_broker
+
+        result = init_broker("none")
+        assert result is None
+        assert get_broker() is None
+
+    def test_none_provider_ignores_kwargs(self):
+        """
+        init_broker('none') must accept but ignore provider-specific kwargs,
+        so the startup code in main.py can pass them unconditionally without
+        branching.
+        """
+        from backend.brokers import get_broker, init_broker
+
+        init_broker("none", host="127.0.0.1", port=4001, api_key="bogus")
+        assert get_broker() is None
+
+    def test_none_provider_is_case_insensitive(self):
+        from backend.brokers import get_broker, init_broker
+
+        init_broker("NONE")
+        assert get_broker() is None
+        init_broker("None")
+        assert get_broker() is None
+
+
 # ── Factory ────────────────────────────────────────────────────────────────
 
 class TestBrokerFactory:
