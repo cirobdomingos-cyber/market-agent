@@ -108,3 +108,65 @@ class TestPositionPollSchedule:
             assert scheduler_module.scheduler.get_job("position_check") is None
             # Other jobs should still be registered
             assert scheduler_module.scheduler.get_job("intelligence_pipeline") is not None
+
+
+class TestSchedulerTimezone:
+    """
+    SCHEDULER_TIMEZONE lets cloud deployments pin cron jobs to the user's
+    local time regardless of where the server runs. Without it, a Railway
+    deploy (UTC) would fire the morning brief at 03:00 BRT.
+
+    The setting is opt-in: empty string means "use server local time"
+    (pre-existing behaviour), any valid IANA zone name overrides, any
+    invalid name logs a warning and falls back safely.
+    """
+
+    def teardown_method(self):
+        if scheduler_module.scheduler.running:
+            scheduler_module.scheduler.shutdown(wait=False)
+        for job in list(scheduler_module.scheduler.get_jobs()):
+            job.remove()
+
+    def test_empty_string_returns_none(self):
+        with patch.object(settings, "scheduler_timezone", ""):
+            assert scheduler_module._cron_timezone() is None
+
+    def test_whitespace_only_returns_none(self):
+        with patch.object(settings, "scheduler_timezone", "   "):
+            assert scheduler_module._cron_timezone() is None
+
+    def test_valid_iana_name_returns_zoneinfo(self):
+        from zoneinfo import ZoneInfo
+        with patch.object(settings, "scheduler_timezone", "America/Sao_Paulo"):
+            tz = scheduler_module._cron_timezone()
+            assert isinstance(tz, ZoneInfo)
+            assert str(tz) == "America/Sao_Paulo"
+
+    def test_invalid_name_returns_none_with_warning(self, caplog):
+        import logging
+        with patch.object(settings, "scheduler_timezone", "Not/A_Real_Zone"), \
+             caplog.at_level(logging.WARNING, logger="backend.scheduler"):
+            tz = scheduler_module._cron_timezone()
+        assert tz is None
+        assert any("not a valid IANA zone name" in rec.message for rec in caplog.records)
+
+    def test_cron_jobs_use_configured_timezone(self):
+        """
+        When SCHEDULER_TIMEZONE is set, both the weekly plan and the
+        morning brief CronTriggers must carry the same ZoneInfo. Without
+        this, the Railway deploy would be silently wrong.
+        """
+        from zoneinfo import ZoneInfo
+        with patch.object(settings, "scheduler_timezone", "America/Sao_Paulo"), \
+             patch.object(settings, "weekly_plan_enabled", True), \
+             patch.object(settings, "morning_brief_enabled", True):
+            scheduler_module.start_scheduler()
+
+            weekly_job = scheduler_module.scheduler.get_job("weekly_plan")
+            morning_job = scheduler_module.scheduler.get_job("morning_brief")
+            assert weekly_job is not None
+            assert morning_job is not None
+
+            expected = ZoneInfo("America/Sao_Paulo")
+            assert weekly_job.trigger.timezone == expected
+            assert morning_job.trigger.timezone == expected

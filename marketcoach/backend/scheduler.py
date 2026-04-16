@@ -11,6 +11,7 @@ APScheduler v3 note:
 """
 
 import logging
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -23,6 +24,33 @@ from backend.agents.orchestrator import Orchestrator
 logger = logging.getLogger(__name__)
 
 scheduler = BackgroundScheduler()
+
+
+def _cron_timezone():
+    """
+    Resolve the timezone for cron-triggered jobs.
+
+    Returns a ZoneInfo instance when settings.scheduler_timezone is a valid
+    IANA name, or None when the setting is empty or invalid. APScheduler's
+    CronTrigger treats timezone=None as "use the scheduler's default", which
+    itself defaults to the server's local timezone — the same behaviour as
+    before this setting existed, so an empty or bad value is backwards-
+    compatible.
+
+    Invalid names are logged loudly but non-fatal; the scheduler still starts.
+    """
+    name = (settings.scheduler_timezone or "").strip()
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            "SCHEDULER_TIMEZONE=%r is not a valid IANA zone name. "
+            "Falling back to server local timezone. Check https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+            name,
+        )
+        return None
 
 
 def _run_intelligence_pipeline() -> None:
@@ -101,6 +129,8 @@ def _run_position_check() -> None:
 
 
 def start_scheduler() -> None:
+    cron_tz = _cron_timezone()
+
     scheduler.add_job(
         _run_intelligence_pipeline,
         trigger=IntervalTrigger(hours=settings.agent_run_interval_hours),
@@ -117,6 +147,7 @@ def start_scheduler() -> None:
                 day_of_week=settings.weekly_plan_day_of_week,
                 hour=settings.weekly_plan_hour,
                 minute=settings.weekly_plan_minute,
+                timezone=cron_tz,
             ),
             id="weekly_plan",
             name="Trading Advisor Weekly Plan",
@@ -134,6 +165,7 @@ def start_scheduler() -> None:
                 day_of_week=settings.morning_brief_day_of_week,
                 hour=settings.morning_brief_hour,
                 minute=settings.morning_brief_minute,
+                timezone=cron_tz,
             ),
             id="morning_brief",
             name="Trading Advisor Morning Brief",
@@ -158,7 +190,8 @@ def start_scheduler() -> None:
 
     scheduler.start()
     logger.info(
-        "Scheduler started — intelligence=%dh, weekly=%s, morning=%s, position_poll=%s",
+        "Scheduler started — tz=%s, intelligence=%dh, weekly=%s, morning=%s, position_poll=%s",
+        str(cron_tz) if cron_tz else "server-local",
         settings.agent_run_interval_hours,
         (
             f"{settings.weekly_plan_day_of_week} "

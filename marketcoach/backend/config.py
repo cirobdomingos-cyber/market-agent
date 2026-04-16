@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     position_reviews_per_poll_max: int = 5
     position_review_session_id: str = "position-reviews-auto"
 
+    # Timezone for cron-triggered jobs (weekly plan, morning brief).
+    # Any IANA zone name, e.g. "America/Sao_Paulo", "UTC". Empty string
+    # means "use the server's local timezone" — fine for local dev on a
+    # laptop in BRT, wrong for cloud hosts like Railway which run in UTC.
+    # When deploying to a cloud host, set this explicitly so the cron
+    # jobs fire in the user's local time, not the server's.
+    scheduler_timezone: str = ""
+
     # Weekly plan cron (APScheduler CronTrigger format)
     weekly_plan_enabled: bool = True
     weekly_plan_day_of_week: str = "sun"   # mon, tue, wed, thu, fri, sat, sun
