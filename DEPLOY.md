@@ -82,51 +82,73 @@ Confirmed every `get_broker()` call site handles `None` gracefully. Added a `"no
 
 Files: `backend/brokers/factory.py`, `backend/main.py`, `tests/test_brokers.py`. Tests: 310 → 313 passing.
 
-### Stage B — Config + secrets inventory ✅ done (this commit)
+### Stage B — Config + secrets inventory ✅ done (commit `cae5f25`)
 
 Audited all 26 env vars. Updated [`marketcoach/.env.example`](marketcoach/.env.example) to cover every setting (was missing IBKR vars, safety gate, news reactions, position reviews, weekly plan cron, morning brief cron). Wrote this `DEPLOY.md`.
 
 Verified: `.env` is gitignored, was never tracked in git history, no secrets leaked anywhere in the repo.
 
-### Stage C — SQLite persistence via Railway volume (next)
+### Stage C — SQLite persistence via Railway volume ✅ done (infra only, no commit)
 
-- Attach a Railway volume to the backend service at `/data` (~$0.25/GB/month)
-- Upload the existing local `marketcoach.db` into the volume on first deploy (preserves journal, executed orders, equity snapshots, watchlist, price alerts)
-- Verify `DATABASE_URL=sqlite:////data/marketcoach.db` resolves to the mounted volume
+- Railway volume attached at `/data` (~$0.25/GB/month)
+- `DATABASE_URL=sqlite:////data/marketcoach.db` (four slashes — `sqlite://` + absolute path)
+- Verified by writing a `TEST` watchlist entry, restarting the container, and confirming the entry survived — see the verification script in the Stage C section below
 - APScheduler is single-process in-memory so multi-replica is not supported anyway — the single-replica volume constraint is fine
+- The deployed DB was created fresh on first boot; the local `marketcoach.db` with ~2 months of paper history was not uploaded (deliberate — wanted a clean slate on the cloud side while the local machine still has the full history for reference)
 
 No code change required. Pure infra.
 
-### Stage D — First deploy + scheduler timezone fix
+### Stage D — First deploy + scheduler timezone fix ✅ done (commits `438c3ef`, `cbee6c3`)
 
-**Code change:** add a `scheduler_timezone: str = ""` setting. In `scheduler.py`, pass `timezone=pytz.timezone(settings.scheduler_timezone)` to every `CronTrigger` when the setting is non-empty.
+**Code change:** added `scheduler_timezone: str = ""` Setting + `_cron_timezone()` helper in [`marketcoach/backend/scheduler.py`](marketcoach/backend/scheduler.py) that resolves the setting through `zoneinfo.ZoneInfo` (stdlib, no `pytz` dependency). Empty string preserves the old behaviour; invalid IANA names log a warning and fall back safely. Both `CronTrigger` calls (weekly plan, morning brief) now carry the resolved timezone. Startup log line includes the active timezone so it's obvious at a glance whether the deploy is configured correctly.
+
+Also committed alongside: a test hygiene fix (`438c3ef`) that makes the test suite hermetic to the local `.env`'s `API_SECRET` via a monkeypatch in `conftest.py`. Without this, setting `API_SECRET` locally (e.g. to match Railway's config) silently breaks 103 tests with 401 errors.
 
 **Railway setup:**
-1. New service from GitHub repo
-2. Root directory: `marketcoach`
-3. Start command: `uvicorn backend.main:app --host 0.0.0.0 --port $PORT`
-4. Attach volume (from Stage C)
-5. Set env vars (from the paste block above)
-6. Deploy
+1. New service from GitHub repo, branch `feat/railway-deploy`
+2. **Settings → Source → Root Directory:** `marketcoach`
+3. **Settings → Build → Start Command:** `uvicorn backend.main:app --host 0.0.0.0 --port 8080`
+4. **Settings → Networking → Generate Domain**, target port `8080`
+5. Attach volume mounted at `/data` (from Stage C)
+6. Set env vars (from the paste block above)
+7. Deploy
 
-**Success criteria in Railway logs:**
+**Port note:** we use a fixed port `8080` matching Railway's current networking default rather than `$PORT`, because Railway's networking UI silently drifted the target port from 8000 → 8080 mid-session and a fixed port on both sides survives that kind of drift without downtime. If Railway ever drifts the target again, match the start command to the new number. The fully Railway-idiomatic `--port $PORT` approach should also work but we couldn't get its auto-detection to cooperate when the networking panel was explicitly asking for a port value.
+
+**Success criteria in Railway logs** (confirmed working on 2026-04-15):
 - `MarketCoach starting up`
-- `Broker provider='none' — broker features disabled.`
-- `Scheduler started — intelligence=4h, weekly=sun 21:00, morning=mon-fri 06:00, position_poll=disabled`
+- `Broker provider='none' — broker features disabled. Trading endpoints will return 'disconnected'; analysis features work normally.`
+- `Scheduler started — tz=America/Sao_Paulo, intelligence=4h, weekly=sun 21:00, morning=mon-fri 06:00, position_poll=every 5min`
 - `Application startup complete.`
-- Health endpoint at `https://<railway-domain>/health` returns `{"status": "ok", "broker_connected": false}`
+- `Uvicorn running on http://0.0.0.0:8080`
+- Health endpoint at `https://<railway-domain>/health` returns `{"status": "ok", "broker": "none", "broker_connected": false, "alpaca_connected": false}`
+
+The `tz=America/Sao_Paulo` in the scheduler line is the single most important checkpoint: it confirms `SCHEDULER_TIMEZONE` landed correctly. Without it you'd see `tz=server-local` and cron jobs would fire at UTC times (morning brief at 03:00 BRT, etc.).
 
 ### Stage E — Point local frontend at Railway
 
-**Code change:** [`marketcoach/frontend/vite.config.js`](marketcoach/frontend/vite.config.js) reads `VITE_API_URL` via Vite's `loadEnv` and uses it as the proxy target, falling back to `http://localhost:8000`.
+Three coupled changes were needed, not one:
 
-**Local setup:**
-1. Create `marketcoach/frontend/.env.local` with `VITE_API_URL=https://<railway-domain>`
-2. Restart Vite dev server
-3. Load http://localhost:5173
-4. Expect: analysis features work, `/portfolio` shows "Broker not configured" (correct — Railway has no broker), trading endpoints return 503
+1. **Proxy target** — [`marketcoach/frontend/vite.config.js`](marketcoach/frontend/vite.config.js) now uses `loadEnv` to read `VITE_API_URL` and forwards `/api/*` to whatever that resolves to. Empty or unset falls back to `http://localhost:8000`, preserving the original local-dev behaviour.
 
-**For trading:** switch `VITE_API_URL` to `http://localhost:8000` (or comment it out), restart Vite, restart the local backend, start IB Gateway. Local backend has the broker; Railway backend has the 24/7 scheduler. Two deployment targets of the same codebase is unusual but legitimate — it's the simplest way to keep analysis always-on without exposing the home network.
+2. **Bearer auth on every axios request** — [`marketcoach/frontend/src/main.jsx`](marketcoach/frontend/src/main.jsx) now reads `VITE_API_SECRET` before React mounts and, if non-empty, installs it as `axios.defaults.headers.common['Authorization']`. Without this, every authenticated backend route would return 401 as soon as the backend has a non-empty `API_SECRET` set. Empty secret is a no-op — local dev with `API_SECRET=""` still works unchanged.
+
+3. **Gitignore** — added `.env.local` and `.env.*.local` patterns at the repo root so frontend secrets don't leak. The existing `.env` pattern alone is a literal match and would not have covered `.env.local`.
+
+**Security note on `VITE_API_SECRET`**: `VITE_*` env vars are inlined into the client bundle at build time. This is fine for a local dev server (never exposed to the internet) but **do not build and deploy a frontend with a real API secret baked in** — anyone who loads the page can read it from the JS bundle. Production frontend deploy needs a different auth story (session cookies, OAuth, or a reverse proxy that injects the header). Out of scope for Phase 1 because the frontend is kept local.
+
+**Local setup for Phase 1:**
+1. `cp marketcoach/frontend/.env.example marketcoach/frontend/.env.local`
+2. Edit `.env.local`:
+   ```
+   VITE_API_URL=https://<your-railway-domain>
+   VITE_API_SECRET=<same value as API_SECRET in Railway env vars>
+   ```
+3. Restart Vite (`npm run dev` → Ctrl+C → re-run); env vars are read once at dev-server start
+4. Load http://localhost:5173
+5. Expect: analysis features work, `/portfolio` shows "Broker not configured" (correct — Railway has no broker), trading endpoints return 503 with a clean error
+
+**For trading:** clear or comment out `VITE_API_URL` and `VITE_API_SECRET` in `.env.local`, restart Vite, restart the local backend, start IB Gateway. Local backend has the broker; Railway backend has the 24/7 scheduler. Two deployment targets of the same codebase is unusual but legitimate — it's the simplest way to keep analysis always-on without exposing the home network.
 
 ---
 
@@ -154,7 +176,27 @@ Analysis features that keep working:
 
 ## Known issues to track
 
-- **Timezone:** requires `SCHEDULER_TIMEZONE` env var + a code change in `scheduler.py` (Stage D)
+- **Railway networking port drift** — Railway's UI silently changed the target port from 8000 → 8080 once during setup. Fixed by binding the start command to 8080 explicitly. If it drifts again, match the start command to the new target; both sides need to agree. Watch for this on future deploys.
 - **Equity history discontinuity:** if live mode is later activated, `equity_snapshots` will show a cliff where the paper-account history ends and live-account snapshots begin. Not a deploy blocker. Future fix: partition snapshots by `is_paper`.
 - **Bug #1 from HANDOFF.md:** fixed in commit `8affa28` (`place_order` now correctly routes limit orders through `LimitOrderRequest` / `_LimitOrder` instead of silently downgrading to market).
 - **Alpaca removal refactor:** queued for a separate branch. Not required for Phase 1 deploy.
+- **Frontend auth is dev-only.** `VITE_API_SECRET` in `.env.local` is inlined into the client bundle at build time. Safe for local dev (Vite dev server isn't exposed) but unsafe for any future frontend deploy. When the frontend eventually moves to a hosting provider, the auth story needs to change — options: session-cookie flow, OAuth, or a reverse proxy that injects the header server-side. Not a Phase 1 concern.
+
+## Phase 1 completion status
+
+All five stages done and verified in production as of 2026-04-16:
+
+| Stage | Scope | Status | Commit |
+|---|---|---|---|
+| A | Broker-degradation audit + `BROKER_PROVIDER=none` | ✅ verified in prod | `da52879` |
+| B | Env var inventory + rewritten `.env.example` + this doc | ✅ | `cae5f25` |
+| C | Railway volume + SQLite persistence across restarts | ✅ verified with `TEST` ticker survival across restart | (infra) |
+| D | `SCHEDULER_TIMEZONE` + timezone-aware cron + test hygiene fix | ✅ `tz=America/Sao_Paulo` in prod logs | `cbee6c3`, `438c3ef` |
+| E | `vite.config.js` proxy env var + frontend bearer auth + `.gitignore` | ✅ | (this commit) |
+
+Next phases — out of scope for this branch:
+
+- Alpaca removal refactor (clean up the now-unused broker path)
+- Frontend deploy with a real auth story
+- Postgres migration (only if SQLite volume size ever becomes a concern)
+- CI via GitHub Actions (pytest on push)
