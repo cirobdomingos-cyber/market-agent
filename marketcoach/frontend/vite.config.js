@@ -15,6 +15,14 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const apiTarget = env.VITE_API_URL || 'http://localhost:8000'
 
+  // Loud startup log so "is the proxy pointed where I think it is?"
+  // is answered in two seconds, not twenty minutes. Visible every time
+  // `npm run dev` boots. Non-secret by design — target is a URL.
+  console.log(
+    `[vite-proxy] VITE_API_URL=${env.VITE_API_URL || '(unset → fallback)'}, ` +
+    `resolved target=${apiTarget}, cwd=${process.cwd()}`
+  )
+
   return {
     plugins: [react()],
     server: {
