@@ -257,6 +257,14 @@ class Orchestrator:
                     error=advisor_result.error,
                 )
                 created += 1
+
+                if advisor_result.success and content:
+                    from backend.notifications import notify
+                    notify(
+                        f"News Alert: {ticker} — {headline[:80]}",
+                        f"<h3>{ticker}: {headline}</h3><p>{content[:2000]}</p>",
+                        f"{ticker}: {headline}\n\n{content[:2000]}",
+                    )
             except Exception as exc:
                 logger.warning(
                     "News reaction generation failed for %s: %s", ticker, exc
@@ -451,6 +459,13 @@ class Orchestrator:
                     logger.info(
                         "Price alert fired: %s %s $%.2f (current $%.2f)",
                         ticker, direction, target, current_price,
+                    )
+
+                    from backend.notifications import notify
+                    notify(
+                        f"Price Alert: {ticker} hit ${current_price:.2f}",
+                        f"<h3>{headline}</h3><p>{content}</p>",
+                        f"{headline}\n\n{content}",
                     )
                 except Exception as exc:
                     logger.warning(

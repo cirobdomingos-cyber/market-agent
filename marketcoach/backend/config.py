@@ -94,6 +94,17 @@ class Settings(BaseSettings):
     morning_brief_minute: int = 0
     morning_brief_session_id: str = "morning-brief-scheduled"
 
+    # ── Email notifications ────────────────────────────────────────────────
+    # When enabled, the scheduler sends email on: morning brief, weekly plan,
+    # news reactions on positions/watchlist, and triggered price alerts.
+    # Uses SMTP (Gmail with an App Password is the simplest setup).
+    notifications_enabled: bool = False
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = ""       # Gmail address
+    smtp_password: str = ""   # Gmail App Password (NOT your Gmail password)
+    notification_email: str = ""  # Where to send (usually same as smtp_user)
+
     default_watchlist: str = "AAPL,MSFT,NVDA,GOOGL,AMZN,TSLA,META,SPY,QQQ"
 
     @property
