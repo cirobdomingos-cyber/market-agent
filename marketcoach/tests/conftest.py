@@ -26,6 +26,8 @@ def _force_dev_mode_auth(monkeypatch):
     monkeypatch is sufficient — no need to re-import backend.main.
     """
     monkeypatch.setattr(settings, "api_secret", "")
+    monkeypatch.setattr(settings, "alpaca_paper", True)
+    monkeypatch.setattr(settings, "alpaca_live_confirmation", "")
 
 
 @pytest.fixture()

@@ -26,6 +26,56 @@ logger = logging.getLogger(__name__)
 scheduler = BackgroundScheduler()
 
 
+def _markdown_to_html(md: str) -> str:
+    """
+    Lightweight markdown-to-HTML for email bodies. Converts the advisor's
+    markdown output into readable HTML without pulling in a full parser.
+    Handles bold, headers, bullet points, and code blocks — enough for
+    morning briefs and weekly plans to look clean in Gmail/Outlook.
+    """
+    import re
+
+    lines = md.split("\n")
+    html_lines = []
+    in_code_block = False
+
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_code_block = not in_code_block
+            html_lines.append("<pre>" if in_code_block else "</pre>")
+            continue
+        if in_code_block:
+            html_lines.append(line)
+            continue
+
+        # Headers
+        if line.startswith("### "):
+            html_lines.append(f"<h3>{line[4:]}</h3>")
+        elif line.startswith("## "):
+            html_lines.append(f"<h2>{line[3:]}</h2>")
+        elif line.startswith("# "):
+            html_lines.append(f"<h1>{line[2:]}</h1>")
+        # Bullet points
+        elif line.strip().startswith("- "):
+            content = line.strip()[2:]
+            content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", content)
+            html_lines.append(f"<li>{content}</li>")
+        else:
+            content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
+            html_lines.append(f"<p>{content}</p>" if content.strip() else "<br>")
+
+    body = "\n".join(html_lines)
+    return (
+        '<div style="font-family: -apple-system, Arial, sans-serif; '
+        'max-width: 600px; line-height: 1.5; color: #222;">'
+        f"{body}"
+        '<hr style="margin-top: 2em; border: none; border-top: 1px solid #ddd;">'
+        '<p style="color: #888; font-size: 0.85em;">'
+        "Sent by MarketCoach &middot; Railway 24/7 scheduler"
+        "</p></div>"
+    )
+
+
 def _cron_timezone():
     """
     Resolve the timezone for cron-triggered jobs.
@@ -82,6 +132,15 @@ def _run_weekly_plan() -> None:
         logger.info(
             "Scheduled weekly plan completed: success=%s", result.success
         )
+        if result.success:
+            reply = result.data.get("reply", "") if result.data else ""
+            if reply:
+                from backend.notifications import notify
+                notify(
+                    "Weekly Plan",
+                    _markdown_to_html(reply),
+                    reply,
+                )
     except Exception as exc:
         logger.exception("Scheduled weekly plan failed: %s", exc)
     finally:
@@ -101,6 +160,15 @@ def _run_morning_brief() -> None:
         logger.info(
             "Scheduled morning brief completed: success=%s", result.success
         )
+        if result.success:
+            reply = result.data.get("reply", "") if result.data else ""
+            if reply:
+                from backend.notifications import notify
+                notify(
+                    "Morning Brief",
+                    _markdown_to_html(reply),
+                    reply,
+                )
     except Exception as exc:
         logger.exception("Scheduled morning brief failed: %s", exc)
     finally:
