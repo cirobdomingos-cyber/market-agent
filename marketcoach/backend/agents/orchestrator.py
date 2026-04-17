@@ -535,6 +535,15 @@ class Orchestrator:
         if not _settings.position_reviews_enabled:
             return 0
 
+        # Check price alerts BEFORE the broker guard — alerts use
+        # yfinance for quotes (not the broker), so they work on Railway
+        # where BROKER_PROVIDER=none. Without this ordering, all price
+        # alerts silently never fire on cloud-hosted backends.
+        try:
+            self._check_price_alerts()
+        except Exception as exc:
+            logger.warning("Price alert check failed: %s", exc)
+
         broker = get_broker()
         if broker is None:
             logger.debug("Position poll: no broker initialised, skipping")
@@ -546,15 +555,6 @@ class Orchestrator:
         # non-fatal — we log and continue so equity-write issues can't
         # break the position review pipeline.
         self._snapshot_equity(broker)
-
-        # Check price alerts — fires notifications when watched levels
-        # are hit. Uses yfinance (via market_data tool) for quotes so
-        # it works for any ticker, not just currently-held positions.
-        # Non-fatal on any failure.
-        try:
-            self._check_price_alerts()
-        except Exception as exc:
-            logger.warning("Price alert check failed: %s", exc)
 
         try:
             current_positions = broker.get_positions()
