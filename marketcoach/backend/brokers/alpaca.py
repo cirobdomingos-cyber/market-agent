@@ -208,11 +208,23 @@ class AlpacaBroker(BrokerClient):
         stop_loss_price: float,
         take_profit_price: float,
         paper_only: bool = True,
+        target_qty: Optional[float] = None,
     ) -> OrderResult:
         # v1: bracket entries are long-only. Shorts would need reversed
         # stop/target semantics and we'd rather refuse than ship a silent bug.
         if side != "buy":
             raise ValueError("Bracket orders only support BUY (long entries) in v1")
+        if target_qty is not None and target_qty < qty:
+            # Alpaca's OrderClass.BRACKET forces equal qty on all legs,
+            # so a scale-out structure would need a manual OCA group we
+            # haven't built yet. Refuse explicitly rather than ship the
+            # wrong structure — the bracket's whole purpose is coupled
+            # correctness.
+            raise NotImplementedError(
+                "Scale-out brackets (target_qty < qty) are not yet supported "
+                "for Alpaca. Use target_qty=None/qty for a classic all-out "
+                "bracket, or switch to IBKR."
+            )
         if paper_only and not self.paper:
             raise ValueError(
                 "Caller requested paper-only but broker is in live mode. "

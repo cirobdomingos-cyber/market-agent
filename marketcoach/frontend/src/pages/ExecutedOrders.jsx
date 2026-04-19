@@ -125,11 +125,51 @@ export default function ExecutedOrders() {
                       LIVE
                     </span>
                   )}
+                  {o.order_class === 'scale_out' && (
+                    <span className="text-xs px-2 py-0.5 rounded bg-indigo-900/60 border border-indigo-700 text-indigo-200 font-mono">
+                      SCALE-OUT {o.target_qty ?? '?'}/{o.qty}
+                    </span>
+                  )}
                 </div>
                 <span className="text-xs text-gray-500 shrink-0">
                   {formatTimestamp(o.created_at)}
                 </span>
               </div>
+
+              {o.order_class === 'scale_out' && o.bracket_state && (
+                <div className="text-xs mt-1 mb-1">
+                  {o.bracket_state === 'fresh' && (
+                    <span className="text-gray-400">
+                      <span className="font-semibold text-indigo-300">T1 pending</span>
+                      {' · '}runner stop at{' '}
+                      <span className="text-red-400 font-mono">
+                        {o.stop_loss_price != null ? `$${Number(o.stop_loss_price).toFixed(2)}` : '—'}
+                      </span>
+                      {' · '}will move to{' '}
+                      <span className="text-emerald-400 font-mono">
+                        {o.limit_price != null ? `$${Number(o.limit_price).toFixed(2)}` : '—'}
+                      </span>
+                      {' (breakeven)'}
+                    </span>
+                  )}
+                  {o.bracket_state === 't1_hit' && (
+                    <span className="text-emerald-300">
+                      <span className="font-semibold">T1 filled</span>
+                      {' · '}runner stop moved to breakeven @{' '}
+                      <span className="font-mono">
+                        {o.limit_price != null ? `$${Number(o.limit_price).toFixed(2)}` : '—'}
+                      </span>
+                      {' — cannot lose money on this trade'}
+                    </span>
+                  )}
+                  {o.bracket_state === 'closed' && (
+                    <span className="text-gray-500">
+                      <span className="font-semibold">Closed</span>
+                      {' · scale-out fully exited'}
+                    </span>
+                  )}
+                </div>
+              )}
 
               {o.fill_price && (
                 <div className="text-xs text-gray-400 mb-1">

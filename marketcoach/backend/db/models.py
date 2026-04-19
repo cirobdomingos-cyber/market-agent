@@ -366,6 +366,19 @@ class ExecutedOrder(Base):
     # order is live the broker owns the OCO group, not us.
     stop_loss_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
+    # Scale-out bracket only: how many shares of `qty` the take-profit
+    # sells. Null or equal to qty means classic "all-out" bracket. When
+    # target_qty < qty, the remaining `qty - target_qty` shares run with
+    # their own stop that the breakeven-move state machine manages.
+    target_qty = Column(Float, nullable=True)
+    # State machine for scale-out brackets: fresh → t1_hit → closed.
+    # - fresh: entry placed, both exits live, nothing has filled yet
+    # - t1_hit: take-profit filled, runner stop moved to breakeven,
+    #   remaining position held until manual close or stop-out
+    # - closed: both exits filled or user cancelled
+    # Null on non-bracket rows and on legacy bracket rows that predate
+    # the state machine.
+    bracket_state = Column(String, nullable=True)       # fresh | t1_hit | closed | null
     fill_price = Column(Float, nullable=True)
     status = Column(String, nullable=False, index=True)  # accepted | filled | rejected | failed
     rejection_reason = Column(Text, nullable=True)

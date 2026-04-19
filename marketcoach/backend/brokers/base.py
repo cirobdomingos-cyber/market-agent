@@ -117,6 +117,7 @@ class BrokerClient(ABC):
         stop_loss_price: float,
         take_profit_price: float,
         paper_only: bool = True,
+        target_qty: Optional[float] = None,
     ) -> OrderResult:
         """
         Submit a bracket entry: a parent LIMIT order with an attached
@@ -128,6 +129,16 @@ class BrokerClient(ABC):
         express a bracket group MUST raise rather than placing the parent
         without the attached exits — the whole point of this method is the
         guaranteed coupling.
+
+        Scale-out bracket (target_qty < qty): the take-profit sells only
+        target_qty shares; the remaining qty - target_qty shares run with
+        their own stop at the same initial stop_loss_price. When the
+        take-profit fills, an out-of-band state machine modifies the
+        runner's stop to the entry price (breakeven). target_qty=None or
+        target_qty=qty means classic all-out bracket (no scale-out,
+        backwards-compatible). Implementations that cannot natively
+        express a scale-out group MUST raise NotImplementedError rather
+        than placing the wrong structure.
 
         Returns the OrderResult of the PARENT order. The attached exit legs
         are tracked at the broker and won't appear in our executed_orders

@@ -463,6 +463,7 @@ class IBKRBroker(BrokerClient):
         stop_loss_price: float,
         take_profit_price: float,
         paper_only: bool = True,
+        target_qty: Optional[float] = None,
     ) -> OrderResult:
         """
         IBKR brackets use ib_insync's helper which returns [parent, takeProfit,
@@ -473,9 +474,25 @@ class IBKRBroker(BrokerClient):
         OrderResult. The exit legs live at the broker and don't appear in
         our executed_orders table until they fill (at which point the
         position poll + journal flow handles the close).
+
+        target_qty is accepted for interface parity with the ABC but the
+        scale-out construction lands in a follow-up commit. For now,
+        scale-out requests raise NotImplementedError so callers don't
+        silently fall back to the wrong structure.
         """
         if side != "buy":
             raise ValueError("Bracket orders only support BUY (long entries) in v1")
+        is_scale_out = target_qty is not None and target_qty < qty
+        if is_scale_out:
+            if target_qty != int(target_qty) or qty != int(qty):
+                raise ValueError(
+                    "Scale-out brackets require integer qty and target_qty"
+                )
+            if target_qty < 1 or qty - target_qty < 1:
+                raise ValueError(
+                    "Scale-out requires at least 1 share on both the T1 leg "
+                    "and the runner leg (so qty >= 2 and 1 <= target_qty < qty)"
+                )
         if paper_only and not self.paper:
             raise ValueError(
                 "Caller requested paper-only but broker is in live mode. "
@@ -494,19 +511,88 @@ class IBKRBroker(BrokerClient):
         async def _do():
             contract = _Stock(ticker, "SMART", "USD")
             await self._ib.qualifyContractsAsync(contract)
-            # ib_insync's bracketOrder helper wires the parentId + tif=GTC
-            # for us. It returns [parent, takeProfit, stopLoss] — submit all
-            # three to establish the OCO group at the broker.
-            bracket = self._ib.bracketOrder(
+
+            if not is_scale_out:
+                # Classic all-out bracket: ib_insync's helper wires parentId
+                # + tif=GTC for us. Returns [parent, takeProfit, stopLoss].
+                bracket = self._ib.bracketOrder(
+                    action="BUY",
+                    quantity=qty,
+                    limitPrice=limit_price,
+                    takeProfitPrice=take_profit_price,
+                    stopLossPrice=stop_loss_price,
+                )
+                trades = [self._ib.placeOrder(contract, o) for o in bracket]
+                await asyncio.sleep(2.0)
+                return trades
+
+            # Scale-out bracket. The helper doesn't support this shape, so
+            # we build four orders by hand:
+            #
+            #   parent BUY N        — entry (limit, tif=GTC, transmit=False)
+            #   TP SELL target_qty  — take-profit on the T1 portion
+            #                         (OCA group A, cancels SL_A on fill)
+            #   SL_A SELL target_qty— stop on the T1 portion
+            #                         (OCA group A, cancels TP on fill)
+            #   SL_B SELL remainder — runner's stop, no OCA group
+            #                         (becomes the breakeven-move target)
+            #
+            # When TP fills, OCA cancels SL_A. Runner shares are still
+            # covered by SL_B at the same initial stop. The state-machine
+            # in the position poll (commit 3) detects the TP fill via the
+            # existing Position delta logic and modifies SL_B.lmtPrice /
+            # auxPrice to the entry price → breakeven stop active.
+            runner_qty = qty - target_qty
+            # Prevents stop+target from colliding with any existing order
+            # group on the account. Keep unique per-ticker-per-session.
+            import time as _time
+            oca_group = f"mc_scaleout_{ticker}_{int(_time.time())}"
+
+            parent = _LimitOrder(
                 action="BUY",
-                quantity=qty,
-                limitPrice=limit_price,
-                takeProfitPrice=take_profit_price,
-                stopLossPrice=stop_loss_price,
+                totalQuantity=qty,
+                lmtPrice=limit_price,
+                tif="GTC",
+                transmit=False,  # children need parentId first
             )
-            trades = [self._ib.placeOrder(contract, o) for o in bracket]
+            parent_trade = self._ib.placeOrder(contract, parent)
+            parent_id = parent.orderId  # ib_insync assigns after placeOrder
+
+            tp_a = _LimitOrder(
+                action="SELL",
+                totalQuantity=target_qty,
+                lmtPrice=take_profit_price,
+                parentId=parent_id,
+                ocaGroup=oca_group,
+                ocaType=1,  # cancel-all-remaining-with-block
+                tif="GTC",
+                transmit=False,
+            )
+            sl_a = _StopOrder(
+                action="SELL",
+                totalQuantity=target_qty,
+                stopPrice=stop_loss_price,
+                parentId=parent_id,
+                ocaGroup=oca_group,
+                ocaType=1,
+                tif="GTC",
+                transmit=False,
+            )
+            sl_b = _StopOrder(
+                action="SELL",
+                totalQuantity=runner_qty,
+                stopPrice=stop_loss_price,
+                parentId=parent_id,
+                tif="GTC",
+                transmit=True,  # last order triggers group submission
+            )
+
+            self._ib.placeOrder(contract, tp_a)
+            self._ib.placeOrder(contract, sl_a)
+            self._ib.placeOrder(contract, sl_b)
+
             await asyncio.sleep(2.0)
-            return trades
+            return [parent_trade]
 
         try:
             trades = _run_on_broker_loop(_do(), timeout=15.0)
@@ -519,11 +605,15 @@ class IBKRBroker(BrokerClient):
                 else None
             )
 
+            scale_tag = (
+                f" [SCALE-OUT: T1={target_qty}, runner={qty - target_qty}]"
+                if is_scale_out else ""
+            )
             logger.info(
                 "IBKR bracket submitted: BUY %s x%.2f @ $%.2f "
-                "(stop $%.2f, target $%.2f) → %s (paper=%s, fill=%s)",
+                "(stop $%.2f, target $%.2f)%s → %s (paper=%s, fill=%s)",
                 ticker, qty, limit_price, stop_loss_price, take_profit_price,
-                status, self.paper, avg_fill,
+                scale_tag, status, self.paper, avg_fill,
             )
 
             return OrderResult(
@@ -667,6 +757,98 @@ class IBKRBroker(BrokerClient):
             return {"status": "cancelled", "order_id": order_id}
         except Exception as exc:
             logger.error("IBKR cancel_order failed for %s: %s", order_id, exc)
+            return {"error": str(exc), "order_id": order_id}
+
+    def find_open_stop_for_ticker_qty(
+        self,
+        ticker: str,
+        qty: float,
+    ) -> Optional[dict]:
+        """
+        Locate an open SELL STOP order for the given ticker + qty. Returns
+        a small dict {order_id, stop_price, orderId} or None if no match.
+
+        Used by the scale-out bracket state machine to find the runner's
+        stop after the T1 leg fills — the runner is the unique open stop
+        order sized exactly (qty - target_qty). IBKR-specific for now;
+        Alpaca would use its open-orders API with the same filter.
+        """
+        if not self._ensure_connected():
+            return None
+
+        async def _do():
+            trades = list(self._ib.openTrades())
+            for t in trades:
+                order = t.order
+                if getattr(order, "orderType", "").upper() != "STP":
+                    continue
+                if getattr(order, "action", "") != "SELL":
+                    continue
+                if float(order.totalQuantity or 0) != float(qty):
+                    continue
+                if t.contract.symbol.upper() != ticker.upper():
+                    continue
+                return {
+                    "order_id": str(order.permId or order.orderId),
+                    "stop_price": float(order.auxPrice or 0.0),
+                    "orderId": order.orderId,
+                }
+            return None
+
+        try:
+            return _run_on_broker_loop(_do(), timeout=5.0)
+        except Exception as exc:
+            logger.warning(
+                "IBKR find_open_stop_for_ticker_qty(%s, %s) failed: %s",
+                ticker, qty, exc,
+            )
+            return None
+
+    def modify_stop_price(self, order_id: str, new_stop_price: float) -> dict:
+        """
+        Move the trigger price of a working stop order without cancelling
+        it. IBKR supports true order modification: re-call placeOrder with
+        the same orderId and a changed auxPrice. No cancel/replace window
+        where the position is unprotected — the broker swaps the trigger
+        level in place.
+        """
+        if not self._ensure_connected():
+            return {"error": "IBKR not configured", "order_id": order_id}
+
+        async def _do():
+            trades = list(self._ib.openTrades())
+            target = None
+            for t in trades:
+                pid = str(t.order.permId) if t.order.permId else None
+                oid = str(t.order.orderId) if t.order.orderId else None
+                if order_id in (pid, oid):
+                    target = t
+                    break
+            if target is None:
+                return {"_not_found": True}
+            target.order.auxPrice = new_stop_price
+            self._ib.placeOrder(target.contract, target.order)
+            await asyncio.sleep(1.0)
+            return {"_ok": True}
+
+        try:
+            result = _run_on_broker_loop(_do(), timeout=10.0)
+            if result.get("_not_found"):
+                return {
+                    "error": f"Order {order_id} not found among open trades",
+                    "order_id": order_id,
+                }
+            logger.info(
+                "IBKR modified stop: order %s → new stop $%.2f",
+                order_id, new_stop_price,
+            )
+            return {
+                "status": "modified",
+                "order_id": order_id,
+                "new_stop_price": new_stop_price,
+            }
+        except Exception as exc:
+            logger.error("IBKR modify_stop_price failed for %s: %s", order_id, exc)
             return {"error": str(exc), "order_id": order_id}
 
     def close_position(self, ticker: str) -> dict:
