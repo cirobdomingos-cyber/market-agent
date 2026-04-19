@@ -18,21 +18,33 @@ MARKET_DATA_TOOL: dict = {
         "Fetch real-time market data, fundamentals, and technical indicators for "
         "stocks and ETFs using ticker symbols. Supports current quotes, technical "
         "analysis (SMA, RSI, MACD, ATR), fundamental metrics (P/E, EPS, revenue, "
-        "margins), price history, and side-by-side ticker comparison."
+        "margins), price history, side-by-side ticker comparison, and ATR-based "
+        "bracket level suggestions (stop + target anchored to volatility)."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["quote", "technicals", "fundamentals", "price_history", "compare"],
+                "enum": [
+                    "quote",
+                    "technicals",
+                    "fundamentals",
+                    "price_history",
+                    "compare",
+                    "suggest_bracket",
+                ],
                 "description": (
                     "The type of data to retrieve. "
                     "'quote' = current price, change, volume, market cap. "
                     "'technicals' = SMA, RSI, MACD, ATR, 52-week range. "
                     "'fundamentals' = P/E, EPS, revenue, margins, dividend, sector. "
                     "'price_history' = daily close prices for the last N days. "
-                    "'compare' = side-by-side metrics for 2–3 tickers."
+                    "'compare' = side-by-side metrics for 2–3 tickers. "
+                    "'suggest_bracket' = ATR-based stop + target suggestion "
+                    "for a proposed entry. Use this as the starting anchor "
+                    "for any bracket order; adjust from there to respect "
+                    "technical levels (support below, resistance above)."
                 ),
             },
             "ticker": {
@@ -49,10 +61,42 @@ MARKET_DATA_TOOL: dict = {
                 "description": "Number of days of price history to return. Default: 30. Only used with 'price_history'.",
                 "default": 30,
             },
+            "entry_price": {
+                "type": "number",
+                "description": (
+                    "Proposed entry price for the 'suggest_bracket' action. "
+                    "Usually the current ask for a market buy or the chosen "
+                    "limit price for a limit buy."
+                ),
+            },
+            "horizon": {
+                "type": "string",
+                "enum": ["day", "swing", "position"],
+                "description": (
+                    "Trade horizon for the 'suggest_bracket' action. "
+                    "'day' = intraday (1× ATR stop). "
+                    "'swing' = 2-20 days (2× ATR, DEFAULT). "
+                    "'position' = 1-6 months (3× ATR, wider to absorb noise)."
+                ),
+                "default": "swing",
+            },
         },
         "required": ["action"],
     },
 }
+
+
+# ATR multipliers per horizon. Tunable in one place if someone later wants
+# tighter day-trader defaults or wider position-trade defaults.
+_ATR_MULTIPLIERS = {
+    "day": 1.0,
+    "swing": 2.0,
+    "position": 3.0,
+}
+# Reward:risk ratios for the suggested targets. 2:1 is the minimum the
+# trading advisor is allowed to recommend; 3:1 is the "great setup" level.
+_RR_T1 = 2.0
+_RR_T2 = 3.0
 
 
 def _safe_get(info: dict, key: str, default=None):
@@ -274,6 +318,103 @@ def _action_compare(tickers: list[str]) -> dict:
     }
 
 
+def _action_suggest_bracket(
+    ticker: str,
+    entry_price: float,
+    horizon: str = "swing",
+) -> dict:
+    """
+    Volatility-anchored stop + target suggestion for a proposed BUY entry.
+
+    Stop = entry − N × ATR(14), where N is the horizon's multiplier.
+    Target 1 = entry + (2 × risk) — classic 2:1 reward:risk.
+    Target 2 = entry + (3 × risk) — optional scale-out level.
+
+    Why ATR instead of percent:
+      A 2% stop on SPY (~$11 move) would rarely trigger; on TSLA (~$8 move)
+      it gets hit by normal intraday noise. ATR normalises: "2× ATR"
+      means the same thing on both — about how much the stock typically
+      moves in two days, so your stop respects the asset's rhythm.
+
+    Returns a dict the advisor can weave into its trade decision matrix.
+    The advisor is expected to ADJUST these numbers based on technical
+    levels (stop just below a real support, target at a real resistance
+    when those are tighter/wider than the ATR suggestion). This is the
+    starting anchor, not the final answer.
+    """
+    if entry_price is None or entry_price <= 0:
+        return {"error": "entry_price must be a positive number."}
+
+    horizon_key = (horizon or "swing").strip().lower()
+    if horizon_key not in _ATR_MULTIPLIERS:
+        return {
+            "error": (
+                f"Unknown horizon '{horizon}'. "
+                f"Valid: {list(_ATR_MULTIPLIERS.keys())}"
+            ),
+        }
+    atr_mult = _ATR_MULTIPLIERS[horizon_key]
+
+    t = _get_ticker(ticker)
+    hist = t.history(period="1y")
+    if hist.empty:
+        return {
+            "error": f"No price history for '{ticker}' — cannot compute ATR.",
+            "suggested_fallback": "Use a 2% default stop if no better anchor is available.",
+        }
+
+    atr = _compute_atr(hist, 14)
+    if atr is None or atr <= 0:
+        return {
+            "error": f"ATR(14) unavailable for '{ticker}' (thin history or data error).",
+            "suggested_fallback": "Use a 2% default stop if no better anchor is available.",
+        }
+
+    risk_per_share = atr * atr_mult
+    stop_loss = round(entry_price - risk_per_share, 2)
+    target_1 = round(entry_price + risk_per_share * _RR_T1, 2)
+    target_2 = round(entry_price + risk_per_share * _RR_T2, 2)
+
+    # Safety: if the ATR stop would be at or below zero (penny stocks,
+    # data error), refuse rather than emit nonsense.
+    if stop_loss <= 0:
+        return {
+            "error": (
+                f"ATR-based stop ({stop_loss}) is non-positive for {ticker} "
+                f"at entry ${entry_price}. ATR ({atr}) × multiplier "
+                f"({atr_mult}) is too wide relative to the entry price. "
+                "Ticker may be a penny stock or the data is malformed."
+            ),
+        }
+
+    reasoning = (
+        f"Stop at {atr_mult:.1f}× ATR-14 (${risk_per_share:.2f}) below "
+        f"entry, accommodating this ticker's typical {horizon_key} "
+        f"volatility. Target 1 at {_RR_T1:.0f}:1 reward:risk "
+        f"(${risk_per_share * _RR_T1:.2f} above entry). Target 2 at "
+        f"{_RR_T2:.0f}:1 for an optional scale-out runner. "
+        "ADJUST from here to respect technical levels — a stop just "
+        "below real support, or a target at real resistance, should "
+        "override these anchors when those levels are tighter or wider."
+    )
+
+    return {
+        "ticker": ticker.upper(),
+        "entry": round(float(entry_price), 2),
+        "horizon": horizon_key,
+        "atr_14": round(float(atr), 2),
+        "atr_multiplier": atr_mult,
+        "risk_per_share": round(float(risk_per_share), 2),
+        "stop_loss": stop_loss,
+        "target_1": target_1,
+        "target_2": target_2,
+        "rr_target_1": _RR_T1,
+        "rr_target_2": _RR_T2,
+        "reasoning": reasoning,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # Dispatch table — keeps execute_market_data() clean.
 _ACTION_HANDLERS = {
     "quote": lambda params: _action_quote(params["ticker"]),
@@ -281,6 +422,11 @@ _ACTION_HANDLERS = {
     "fundamentals": lambda params: _action_fundamentals(params["ticker"]),
     "price_history": lambda params: _action_price_history(params["ticker"], params.get("days", 30)),
     "compare": lambda params: _action_compare(params["tickers"]),
+    "suggest_bracket": lambda params: _action_suggest_bracket(
+        params["ticker"],
+        params.get("entry_price"),
+        params.get("horizon", "swing"),
+    ),
 }
 
 
@@ -289,6 +435,8 @@ def execute_market_data(
     ticker: str | None = None,
     tickers: list[str] | None = None,
     days: int = 30,
+    entry_price: float | None = None,
+    horizon: str = "swing",
 ) -> dict:
     """
     Execute a market data action and return a result dict.
@@ -308,11 +456,22 @@ def execute_market_data(
     if action == "compare":
         if not tickers:
             return {"error": "The 'compare' action requires a 'tickers' array with 2–3 symbols."}
+    elif action == "suggest_bracket":
+        if not ticker:
+            return {"error": "The 'suggest_bracket' action requires a 'ticker' parameter."}
+        if entry_price is None:
+            return {"error": "The 'suggest_bracket' action requires an 'entry_price' parameter."}
     else:
         if not ticker:
             return {"error": f"The '{action}' action requires a 'ticker' parameter."}
 
-    params = {"ticker": ticker, "tickers": tickers or [], "days": days}
+    params = {
+        "ticker": ticker,
+        "tickers": tickers or [],
+        "days": days,
+        "entry_price": entry_price,
+        "horizon": horizon,
+    }
 
     try:
         result = _ACTION_HANDLERS[action](params)
