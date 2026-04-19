@@ -62,7 +62,7 @@ export default function ExecutedOrders() {
         <h1 className="text-2xl font-bold text-white">Executed Orders</h1>
         <p className="text-sm text-gray-400 mt-1">
           Audit trail of every order MarketCoach placed on your behalf — including
-          orders that the safety gates rejected before reaching Alpaca.
+          orders that the safety gates rejected before reaching the broker.
         </p>
       </div>
 
@@ -192,7 +192,7 @@ export default function ExecutedOrders() {
 
               {o.alpaca_order_id && (
                 <p className="text-[10px] text-gray-600 mt-2 font-mono">
-                  Alpaca id: {o.alpaca_order_id}
+                  Broker id: {o.alpaca_order_id}
                 </p>
               )}
             </div>
