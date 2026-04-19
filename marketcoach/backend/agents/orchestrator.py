@@ -651,6 +651,161 @@ class Orchestrator:
 
         return fired
 
+    def _advance_scale_out_state_machine(self, broker) -> int:
+        """
+        Walk all scale-out brackets in 'fresh' state and advance their
+        state machines. Fires on every position poll.
+
+        Transitions:
+          fresh → t1_hit   when current broker position qty equals the
+                           runner qty (qty - target_qty). The take-profit
+                           filled, OCA cancelled the matching stop, and
+                           the runner leg is the only thing left. We
+                           modify the runner's stop at the broker to the
+                           entry price (breakeven) and email the user.
+          fresh → closed   when current broker position qty is 0. Either
+                           the user manually closed or both the T1 leg
+                           AND the runner's stop fired. State machine is
+                           done either way.
+
+        IBKR-only for now — the modify-in-place pattern is how TWS works.
+        Alpaca scale-out isn't supported yet (see place_bracket_order),
+        so there are no scale_out rows from an Alpaca broker to advance.
+        If the broker instance isn't IBKR, we silently skip so mixed-
+        broker futures don't break.
+
+        Returns the number of state transitions performed.
+        """
+        from backend.brokers.ibkr import IBKRBroker
+        from backend.db.models import ExecutedOrder
+
+        if not isinstance(broker, IBKRBroker):
+            return 0
+
+        fresh = (
+            self.db.query(ExecutedOrder)
+            .filter(
+                ExecutedOrder.order_class == "scale_out",
+                ExecutedOrder.bracket_state == "fresh",
+                ExecutedOrder.status.in_(["accepted", "filled"]),
+            )
+            .all()
+        )
+        if not fresh:
+            return 0
+
+        try:
+            positions = {
+                p["ticker"].upper(): p for p in broker.get_positions()
+            }
+        except Exception as exc:
+            logger.warning(
+                "Scale-out state machine: get_positions failed: %s", exc,
+            )
+            return 0
+
+        transitioned = 0
+        for order in fresh:
+            ticker = order.ticker.upper()
+            pos = positions.get(ticker)
+            current_qty = float(pos["qty"]) if pos else 0.0
+            runner_qty = float(order.qty) - float(order.target_qty or 0)
+
+            if current_qty == 0:
+                # Both exits fired (T1 then stop/target on runner) or
+                # manual close. No stop to modify; just close out state.
+                order.bracket_state = "closed"
+                self.db.commit()
+                transitioned += 1
+                logger.info(
+                    "Scale-out %s [%s]: position closed, state=closed",
+                    order.id, ticker,
+                )
+                continue
+
+            if current_qty != runner_qty:
+                # Either T1 hasn't filled yet (current_qty == order.qty)
+                # or we're in some unexpected intermediate state. Leave
+                # state=fresh and try again next poll.
+                continue
+
+            # T1 filled — move runner stop to breakeven. Find the stop
+            # order (the unique open SELL STOP for this ticker + runner_qty).
+            stop_info = broker.find_open_stop_for_ticker_qty(
+                ticker, runner_qty,
+            )
+            if stop_info is None:
+                logger.warning(
+                    "Scale-out %s [%s]: T1 filled but runner stop not "
+                    "found in open orders. Leaving state=fresh for "
+                    "retry next poll.",
+                    order.id, ticker,
+                )
+                continue
+
+            entry_price = float(order.limit_price or 0.0)
+            if entry_price <= 0:
+                logger.warning(
+                    "Scale-out %s [%s]: missing entry price on the "
+                    "executed_orders row; cannot compute breakeven. "
+                    "Leaving state=fresh.",
+                    order.id, ticker,
+                )
+                continue
+
+            result = broker.modify_stop_price(
+                stop_info["order_id"], entry_price,
+            )
+            if "error" in result:
+                logger.warning(
+                    "Scale-out %s [%s]: modify_stop_price failed: %s. "
+                    "Leaving state=fresh for retry.",
+                    order.id, ticker, result["error"],
+                )
+                continue
+
+            order.bracket_state = "t1_hit"
+            self.db.commit()
+            transitioned += 1
+            logger.info(
+                "Scale-out %s [%s]: T1 filled → runner stop moved "
+                "$%.2f → $%.2f (breakeven), state=t1_hit",
+                order.id, ticker, stop_info["stop_price"], entry_price,
+            )
+
+            try:
+                from backend.notifications import notify
+                tp = float(order.take_profit_price or 0.0)
+                target_qty = float(order.target_qty or 0)
+                notify(
+                    f"{ticker} T1 filled — stop moved to breakeven",
+                    (
+                        f"<h3>{ticker}: T1 hit at ${tp:.2f}</h3>"
+                        f"<p>Sold {target_qty:.0f} shares at the "
+                        f"take-profit level. Runner ({runner_qty:.0f} "
+                        f"shares) stop has been moved from "
+                        f"${stop_info['stop_price']:.2f} to "
+                        f"${entry_price:.2f} (entry / breakeven).</p>"
+                        f"<p><strong>From here you cannot lose money "
+                        f"on this trade.</strong> The runner will either "
+                        f"keep running (unlimited upside) or stop out at "
+                        f"breakeven (zero loss).</p>"
+                    ),
+                    (
+                        f"{ticker} T1 filled at ${tp:.2f}. "
+                        f"Runner stop moved to ${entry_price:.2f} "
+                        f"(breakeven). Cannot lose money on this trade "
+                        f"from here."
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Scale-out %s [%s]: email notify failed: %s",
+                    order.id, ticker, exc,
+                )
+
+        return transitioned
+
     def _snapshot_equity(self, broker) -> None:
         """
         Write one equity_snapshots row using the current broker account.
@@ -725,6 +880,14 @@ class Orchestrator:
         if broker is None:
             logger.debug("Position poll: no broker initialised, skipping")
             return 0
+
+        # Advance scale-out bracket state machines before equity snapshot
+        # so bracket_state reflects the current picture when anything else
+        # reads it. Non-fatal: state-machine failures log + continue.
+        try:
+            self._advance_scale_out_state_machine(broker)
+        except Exception as exc:
+            logger.warning("Scale-out state machine failed: %s", exc)
 
         # Snapshot account equity regardless of position changes. This
         # runs on every poll (including the first) so the Dashboard's

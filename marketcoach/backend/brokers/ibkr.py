@@ -759,6 +759,98 @@ class IBKRBroker(BrokerClient):
             logger.error("IBKR cancel_order failed for %s: %s", order_id, exc)
             return {"error": str(exc), "order_id": order_id}
 
+    def find_open_stop_for_ticker_qty(
+        self,
+        ticker: str,
+        qty: float,
+    ) -> Optional[dict]:
+        """
+        Locate an open SELL STOP order for the given ticker + qty. Returns
+        a small dict {order_id, stop_price, orderId} or None if no match.
+
+        Used by the scale-out bracket state machine to find the runner's
+        stop after the T1 leg fills — the runner is the unique open stop
+        order sized exactly (qty - target_qty). IBKR-specific for now;
+        Alpaca would use its open-orders API with the same filter.
+        """
+        if not self._ensure_connected():
+            return None
+
+        async def _do():
+            trades = list(self._ib.openTrades())
+            for t in trades:
+                order = t.order
+                if getattr(order, "orderType", "").upper() != "STP":
+                    continue
+                if getattr(order, "action", "") != "SELL":
+                    continue
+                if float(order.totalQuantity or 0) != float(qty):
+                    continue
+                if t.contract.symbol.upper() != ticker.upper():
+                    continue
+                return {
+                    "order_id": str(order.permId or order.orderId),
+                    "stop_price": float(order.auxPrice or 0.0),
+                    "orderId": order.orderId,
+                }
+            return None
+
+        try:
+            return _run_on_broker_loop(_do(), timeout=5.0)
+        except Exception as exc:
+            logger.warning(
+                "IBKR find_open_stop_for_ticker_qty(%s, %s) failed: %s",
+                ticker, qty, exc,
+            )
+            return None
+
+    def modify_stop_price(self, order_id: str, new_stop_price: float) -> dict:
+        """
+        Move the trigger price of a working stop order without cancelling
+        it. IBKR supports true order modification: re-call placeOrder with
+        the same orderId and a changed auxPrice. No cancel/replace window
+        where the position is unprotected — the broker swaps the trigger
+        level in place.
+        """
+        if not self._ensure_connected():
+            return {"error": "IBKR not configured", "order_id": order_id}
+
+        async def _do():
+            trades = list(self._ib.openTrades())
+            target = None
+            for t in trades:
+                pid = str(t.order.permId) if t.order.permId else None
+                oid = str(t.order.orderId) if t.order.orderId else None
+                if order_id in (pid, oid):
+                    target = t
+                    break
+            if target is None:
+                return {"_not_found": True}
+            target.order.auxPrice = new_stop_price
+            self._ib.placeOrder(target.contract, target.order)
+            await asyncio.sleep(1.0)
+            return {"_ok": True}
+
+        try:
+            result = _run_on_broker_loop(_do(), timeout=10.0)
+            if result.get("_not_found"):
+                return {
+                    "error": f"Order {order_id} not found among open trades",
+                    "order_id": order_id,
+                }
+            logger.info(
+                "IBKR modified stop: order %s → new stop $%.2f",
+                order_id, new_stop_price,
+            )
+            return {
+                "status": "modified",
+                "order_id": order_id,
+                "new_stop_price": new_stop_price,
+            }
+        except Exception as exc:
+            logger.error("IBKR modify_stop_price failed for %s: %s", order_id, exc)
+            return {"error": str(exc), "order_id": order_id}
+
     def close_position(self, ticker: str) -> dict:
         if not self._ensure_connected():
             return {"error": "IBKR not configured"}
