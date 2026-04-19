@@ -463,6 +463,7 @@ class IBKRBroker(BrokerClient):
         stop_loss_price: float,
         take_profit_price: float,
         paper_only: bool = True,
+        target_qty: Optional[float] = None,
     ) -> OrderResult:
         """
         IBKR brackets use ib_insync's helper which returns [parent, takeProfit,
@@ -473,9 +474,20 @@ class IBKRBroker(BrokerClient):
         OrderResult. The exit legs live at the broker and don't appear in
         our executed_orders table until they fill (at which point the
         position poll + journal flow handles the close).
+
+        target_qty is accepted for interface parity with the ABC but the
+        scale-out construction lands in a follow-up commit. For now,
+        scale-out requests raise NotImplementedError so callers don't
+        silently fall back to the wrong structure.
         """
         if side != "buy":
             raise ValueError("Bracket orders only support BUY (long entries) in v1")
+        if target_qty is not None and target_qty < qty:
+            raise NotImplementedError(
+                "Scale-out bracket construction for IBKR is not wired up in "
+                "this commit — follows in the next one. Use target_qty=None "
+                "or target_qty=qty for a classic all-out bracket."
+            )
         if paper_only and not self.paper:
             raise ValueError(
                 "Caller requested paper-only but broker is in live mode. "

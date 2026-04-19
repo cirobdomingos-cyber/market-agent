@@ -298,7 +298,7 @@ class TestIBKRBroker:
 
 class TestPendingOrdersAndCancel:
     """
-    New broker ABC methods: get_pending_orders() and cancel_order(). Covers
+    Broker ABC methods get_pending_orders() and cancel_order(). Covers
     disconnected behaviour (never raise, return empty/error dict), plus the
     IBKR cancel happy path via a mocked IB instance.
     """
@@ -384,3 +384,63 @@ class TestPendingOrdersAndCancel:
         result = b.cancel_order("42")
         assert result["status"] == "cancelled"
         fake_ib.cancelOrder.assert_called_once_with(fake_order)
+
+
+# ── Scale-out bracket plumbing (target_qty parameter) ─────────────────────────
+
+class TestScaleOutBracketSignature:
+    """
+    Commit 1 of the breakeven-stop feature wires target_qty through the
+    ABC, both broker impls, and the endpoint. The actual scale-out order
+    construction lands in the next commit; for now, both brokers must
+    explicitly raise NotImplementedError when target_qty < qty so callers
+    don't silently fall back to an all-out bracket with the wrong qty.
+    """
+
+    def test_alpaca_raises_notimplemented_on_scale_out(self):
+        b = AlpacaBroker(api_key="", secret_key="", paper=True)
+        with pytest.raises(NotImplementedError, match="[Ss]cale-out"):
+            b.place_bracket_order(
+                ticker="SPY",
+                qty=2,
+                side="buy",
+                limit_price=540.0,
+                stop_loss_price=534.0,
+                take_profit_price=552.0,
+                paper_only=True,
+                target_qty=1,
+            )
+
+    def test_alpaca_accepts_target_qty_equal_to_qty(self):
+        """
+        target_qty == qty is not scale-out — it's the classic all-out
+        bracket expressed explicitly. Must not raise. Since the broker
+        isn't connected we get error_disconnected; the point is we don't
+        hit the NotImplementedError path.
+        """
+        b = AlpacaBroker(api_key="", secret_key="", paper=True)
+        result = b.place_bracket_order(
+            ticker="SPY",
+            qty=2,
+            side="buy",
+            limit_price=540.0,
+            stop_loss_price=534.0,
+            take_profit_price=552.0,
+            paper_only=True,
+            target_qty=2,
+        )
+        assert result.status == "error_disconnected"
+
+    def test_ibkr_raises_notimplemented_on_scale_out(self):
+        b = IBKRBroker(paper=True)
+        with pytest.raises(NotImplementedError, match="[Ss]cale-out"):
+            b.place_bracket_order(
+                ticker="SPY",
+                qty=2,
+                side="buy",
+                limit_price=540.0,
+                stop_loss_price=534.0,
+                take_profit_price=552.0,
+                paper_only=True,
+                target_qty=1,
+            )

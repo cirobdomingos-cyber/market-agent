@@ -227,6 +227,15 @@ class OrderConfirmRequest(BaseModel):
     # endpoint for the full set of rules (buy-only, limit-only, level order).
     stop_loss: Optional[float] = Field(default=None, gt=0)
     target_1: Optional[float] = Field(default=None, gt=0)
+    # Scale-out bracket: how many shares target_1 sells. None or == qty
+    # means classic all-out bracket (take-profit sells the whole position
+    # and the stop auto-cancels via OCA). target_qty < qty means the
+    # take-profit sells only that portion and the rest runs with a stop
+    # at the same price — when target_1 fills, the runner's stop moves
+    # to the entry price (breakeven) via the state machine in the
+    # position poll. Must be a positive integer strictly less than qty
+    # to enable scale-out; anything else falls back to all-out.
+    target_qty: Optional[float] = Field(default=None, gt=0)
     rationale: Optional[str] = Field(default=None, max_length=500)
     advisor_session_id: Optional[str] = Field(default=None, max_length=64)
     # Live mode safety: this field MUST be present and True when the system
@@ -989,6 +998,30 @@ def confirm_order(
                     f"target_1 ({request.target_1})."
                 ),
             )
+        # Scale-out validation: target_qty, when provided, must be a
+        # positive integer strictly less than qty (if equal or greater,
+        # it's a no-op — normalise to None). Integer check because
+        # exchanges can't sell 1.5 shares at one price and 1.5 at another.
+        if request.target_qty is not None:
+            if request.target_qty >= request.qty:
+                # Silent normalise — user asked for scale-out of the full
+                # position, which is just a classic bracket. Clear the
+                # field so downstream treats it as all-out.
+                request.target_qty = None
+            elif request.target_qty != int(request.target_qty):
+                raise HTTPException(
+                    status_code=422,
+                    detail="target_qty must be a whole number of shares.",
+                )
+            elif int(request.qty) != request.qty:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Scale-out brackets require integer qty (the parent "
+                        "qty and target_qty must both be whole shares so the "
+                        "runner leg has a whole number of shares to cover)."
+                    ),
+                )
 
     # Gate 2 — live-mode confirmation
     if settings.is_live_mode and not request.confirm_live_capital:
@@ -1109,6 +1142,21 @@ def confirm_order(
     # place_bracket_order which returns the parent leg; the attached
     # take-profit and stop-loss legs live at the broker from here on.
     from datetime import datetime, timezone
+
+    # Classify: simple / bracket / scale-out. Scale-out is a subtype of
+    # bracket with target_qty < qty. Kept as a separate column value so
+    # the position-poll state machine can find rows to react to without
+    # re-parsing target_qty. None target_qty or equal-to-qty = plain bracket.
+    is_scale_out = (
+        is_bracket
+        and request.target_qty is not None
+        and request.target_qty < request.qty
+    )
+    resolved_order_class = (
+        "scale_out" if is_scale_out else ("bracket" if is_bracket else "simple")
+    )
+    initial_bracket_state = "fresh" if is_scale_out else None
+
     try:
         if is_bracket:
             result = client.place_bracket_order(
@@ -1119,6 +1167,7 @@ def confirm_order(
                 stop_loss_price=request.stop_loss,
                 take_profit_price=request.target_1,
                 paper_only=not settings.is_live_mode,
+                target_qty=request.target_qty,
             )
         else:
             result = client.place_order(
@@ -1137,10 +1186,12 @@ def confirm_order(
             side=request.side,
             qty=request.qty,
             order_type=request.order_type,
-            order_class="bracket" if is_bracket else "simple",
+            order_class=resolved_order_class,
             limit_price=request.limit_price,
             stop_loss_price=request.stop_loss,
             take_profit_price=request.target_1,
+            target_qty=request.target_qty,
+            bracket_state=initial_bracket_state,
             status="failed",
             rejection_reason=str(exc),
             is_paper=not settings.is_live_mode,
@@ -1156,10 +1207,12 @@ def confirm_order(
         side=result.side,
         qty=result.qty,
         order_type=request.order_type,
-        order_class="bracket" if is_bracket else "simple",
+        order_class=resolved_order_class,
         limit_price=request.limit_price,
         stop_loss_price=request.stop_loss,
         take_profit_price=request.target_1,
+        target_qty=request.target_qty,
+        bracket_state=initial_bracket_state,
         fill_price=result.fill_price,
         status="filled" if result.fill_price else "accepted",
         is_paper=result.is_paper,

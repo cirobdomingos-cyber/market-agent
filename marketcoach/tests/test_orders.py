@@ -500,3 +500,116 @@ class TestAdvisorTradeProposalFlag:
         assert "trade-proposal" not in rendered
         assert "Trade execution format" not in rendered
         assert "Trade execution format" not in rendered
+
+
+# ── Scale-out bracket endpoint plumbing ──────────────────────────────────────
+
+class TestScaleOutBracketEndpoint:
+    """
+    Commit 1 wires target_qty through /orders/confirm so scale-out
+    brackets can be specified by the UI. Tests here cover the endpoint-
+    level validation and DB persistence. The actual broker-side
+    construction lands in the follow-up commit — these tests use a
+    mocked broker so we only verify the request-to-DB path.
+    """
+
+    def _bracket_request(self, **overrides):
+        base = _valid_request(
+            ticker="NVDA",
+            qty=2,
+            stop_loss=440.00,
+            target_1=470.00,
+        )
+        base.update(overrides)
+        return base
+
+    def test_scale_out_persists_target_qty_and_fresh_state(self, client, db, mock_alpaca):
+        from backend.db.models import ExecutedOrder
+
+        mock_alpaca.place_bracket_order.return_value = OrderResult(
+            order_id="ord-123", ticker="NVDA", qty=2.0, side="buy",
+            status="accepted", is_paper=True, fill_price=None,
+        )
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            resp = client.post(
+                "/orders/confirm",
+                json=self._bracket_request(qty=2, target_qty=1),
+            )
+        assert resp.status_code == 200, resp.text
+
+        row = db.query(ExecutedOrder).first()
+        assert row.order_class == "scale_out"
+        assert row.target_qty == 1.0
+        assert row.bracket_state == "fresh"
+
+    def test_scale_out_forwards_target_qty_to_broker(self, client, mock_alpaca):
+        mock_alpaca.place_bracket_order.return_value = OrderResult(
+            order_id="ord", ticker="NVDA", qty=4.0, side="buy",
+            status="accepted", is_paper=True, fill_price=None,
+        )
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            client.post(
+                "/orders/confirm",
+                json=self._bracket_request(qty=4, target_qty=2),
+            )
+        mock_alpaca.place_bracket_order.assert_called_once()
+        kwargs = mock_alpaca.place_bracket_order.call_args.kwargs
+        assert kwargs["target_qty"] == 2
+        assert kwargs["qty"] == 4
+
+    def test_all_out_bracket_persists_plain_bracket_class(self, client, db, mock_alpaca):
+        """Classic bracket (no target_qty) still works — order_class='bracket', bracket_state=null."""
+        from backend.db.models import ExecutedOrder
+
+        mock_alpaca.place_bracket_order.return_value = OrderResult(
+            order_id="ord", ticker="NVDA", qty=2.0, side="buy",
+            status="accepted", is_paper=True, fill_price=None,
+        )
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            resp = client.post("/orders/confirm", json=self._bracket_request(qty=2))
+        assert resp.status_code == 200, resp.text
+
+        row = db.query(ExecutedOrder).first()
+        assert row.order_class == "bracket"
+        assert row.target_qty is None
+        assert row.bracket_state is None
+
+    def test_target_qty_equal_to_qty_normalises_to_none(self, client, db, mock_alpaca):
+        """
+        Scale-out with target_qty == qty is a no-op (same as all-out).
+        Endpoint normalises the field to None so downstream doesn't have
+        to double-check. Row should read like a classic bracket.
+        """
+        from backend.db.models import ExecutedOrder
+
+        mock_alpaca.place_bracket_order.return_value = OrderResult(
+            order_id="ord", ticker="NVDA", qty=2.0, side="buy",
+            status="accepted", is_paper=True, fill_price=None,
+        )
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            client.post(
+                "/orders/confirm",
+                json=self._bracket_request(qty=2, target_qty=2),
+            )
+        row = db.query(ExecutedOrder).first()
+        assert row.order_class == "bracket"
+        assert row.target_qty is None
+        assert row.bracket_state is None
+
+    def test_fractional_target_qty_rejected(self, client, mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            resp = client.post(
+                "/orders/confirm",
+                json=self._bracket_request(qty=4, target_qty=1.5),
+            )
+        assert resp.status_code == 422
+        assert "whole number" in resp.json()["detail"].lower()
+
+    def test_fractional_qty_with_scale_out_rejected(self, client, mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_alpaca):
+            resp = client.post(
+                "/orders/confirm",
+                json=self._bracket_request(qty=2.5, target_qty=1),
+            )
+        assert resp.status_code == 422
+        assert "integer qty" in resp.json()["detail"].lower()
