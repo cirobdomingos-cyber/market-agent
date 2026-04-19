@@ -88,7 +88,16 @@ class NewsAgent(BaseAgent):
     """
     Fetches financial news via web search and extracts sentiment signals.
     Results are cached for NEWS_CACHE_TTL_MINUTES to respect rate limits.
+
+    Uses Haiku rather than the default Sonnet. News extraction is a
+    structured task (pull ticker + sentiment + confidence from a small
+    set of headlines) where Haiku performs at parity with Sonnet at
+    ~10x lower input cost. The intelligence pipeline runs this agent
+    on every scheduled cycle — swapping the model compounds across
+    every run on Railway.
     """
+
+    MODEL = "claude-haiku-4-5-20251001"
 
     _cache: dict = {}  # class-level cache shared across instances
 

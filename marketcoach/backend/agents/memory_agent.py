@@ -16,7 +16,7 @@ from typing import Any
 import anthropic
 from sqlalchemy.orm import Session
 
-from backend.agents.base import MODEL, AgentResult, BaseAgent
+from backend.agents.base import AgentResult, BaseAgent
 from backend.db.crud import get_all_memories, upsert_memory
 
 logger = logging.getLogger(__name__)
@@ -102,7 +102,7 @@ class MemoryAgent(BaseAgent):
 
         try:
             response = self.client.messages.create(
-                model=MODEL,
+                model=self.MODEL,
                 max_tokens=1024,
                 system=EXTRACTION_SYSTEM,
                 messages=[

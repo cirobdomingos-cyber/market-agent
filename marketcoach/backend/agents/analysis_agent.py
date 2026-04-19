@@ -31,7 +31,7 @@ import anthropic
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from backend.agents.base import MODEL, AgentResult, BaseAgent
+from backend.agents.base import AgentResult, BaseAgent
 from backend.db import crud
 from backend.db.models import Signal
 

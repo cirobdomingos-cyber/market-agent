@@ -25,7 +25,12 @@ import anthropic
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-# Keep this in one place — easy to swap model versions.
+# Default model for every agent. Subclasses can override the class-level
+# BaseAgent.MODEL attribute to use a different tier for their task — e.g.
+# NewsAgent uses Haiku because news extraction is a structured task where
+# the smaller model is ~10x cheaper with no measurable quality loss. The
+# advisor / analysis / trade-idea agents keep this Sonnet default because
+# they do multi-step reasoning where the bigger model earns its cost.
 MODEL = "claude-sonnet-4-6"
 MAX_TOOL_ITERATIONS = 10
 
@@ -50,7 +55,16 @@ class BaseAgent(ABC):
     Subclasses must implement:
       - run(context) → AgentResult
       - _execute_tool(name, input) → str   (if the agent uses tools)
+
+    Subclasses MAY override:
+      - MODEL — the Anthropic model ID used for this agent's calls.
+                Defaults to module-level MODEL (Sonnet). Override with a
+                class-level attribute, e.g.:
+                    class MyAgent(BaseAgent):
+                        MODEL = "claude-haiku-4-5-20251001"
     """
+
+    MODEL: str = MODEL  # class-level; subclasses override for per-agent tiering
 
     def __init__(self, db: Session, client: anthropic.Anthropic):
         self.db = db
@@ -153,7 +167,7 @@ class BaseAgent(ABC):
         for attempt in range(max_retries):
             try:
                 response = self.client.messages.create(
-                    model=MODEL,
+                    model=self.MODEL,
                     max_tokens=4096,
                     system=system,
                     messages=messages,
