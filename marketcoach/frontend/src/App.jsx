@@ -6,6 +6,7 @@ import TradeIdeas from './pages/TradeIdeas'
 import Coach from './pages/Coach'
 import Advisor from './pages/Advisor'
 import Portfolio from './pages/Portfolio'
+import Markets from './pages/Markets'
 import Backtest from './pages/Backtest'
 import Calendar from './pages/Calendar'
 import WeeklyPlan from './pages/WeeklyPlan'
@@ -127,6 +128,14 @@ export default function App() {
             Portfolio
           </NavLink>
           <NavLink
+            to="/markets"
+            className={({ isActive }) =>
+              isActive ? 'text-white font-medium' : 'text-gray-400 hover:text-white'
+            }
+          >
+            Markets
+          </NavLink>
+          <NavLink
             to="/orders"
             className={({ isActive }) =>
               isActive ? 'text-white font-medium' : 'text-gray-400 hover:text-white'
@@ -197,6 +206,7 @@ export default function App() {
             <Route path="/coach" element={<Coach />} />
             <Route path="/advisor" element={<Advisor />} />
             <Route path="/portfolio" element={<Portfolio />} />
+            <Route path="/markets" element={<Markets />} />
             <Route path="/backtest" element={<Backtest />} />
             <Route path="/calendar" element={<Calendar />} />
             <Route path="/weekly-plan" element={<WeeklyPlan />} />
