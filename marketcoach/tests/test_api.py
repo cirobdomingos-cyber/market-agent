@@ -393,3 +393,109 @@ class TestMarketDataRoutes:
         ):
             resp = client.get("/market-data/XYZZY/history")
         assert resp.status_code == 404
+
+
+class TestPendingOrdersRoutes:
+    """
+    HTTP surface for the Portfolio page's new Pending Orders section.
+    Tests mock get_broker so we don't need a live broker connection.
+    """
+
+    def test_pending_empty_when_broker_disconnected(self, client):
+        from unittest.mock import patch
+        with patch("backend.main.get_broker", return_value=None):
+            resp = client.get("/orders/pending")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_pending_returns_broker_list(self, client):
+        from unittest.mock import patch, MagicMock
+        mock_broker = MagicMock()
+        mock_broker.get_pending_orders.return_value = [
+            {
+                "order_id": "1046335652",
+                "ticker": "SLV",
+                "qty": 1.0,
+                "filled_qty": 0.0,
+                "side": "buy",
+                "order_type": "limit",
+                "order_class": "bracket",
+                "status": "submitted",
+                "limit_price": 71.25,
+                "stop_price": None,
+                "submitted_at": "2026-04-17T13:09:49Z",
+                "parent_id": None,
+            }
+        ]
+        with patch("backend.main.get_broker", return_value=mock_broker):
+            resp = client.get("/orders/pending")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body) == 1
+        assert body[0]["ticker"] == "SLV"
+        assert body[0]["limit_price"] == 71.25
+
+    def test_cancel_returns_503_when_broker_disconnected(self, client):
+        from unittest.mock import patch
+        with patch("backend.main.get_broker", return_value=None):
+            resp = client.delete("/orders/1046335652")
+        assert resp.status_code == 503
+
+    def test_cancel_returns_404_when_order_not_found(self, client):
+        from unittest.mock import patch, MagicMock
+        mock_broker = MagicMock()
+        mock_broker.cancel_order.return_value = {
+            "error": "Order 1046335652 not found among open trades. "
+                     "It may have already filled or been cancelled.",
+            "order_id": "1046335652",
+        }
+        with patch("backend.main.get_broker", return_value=mock_broker):
+            resp = client.delete("/orders/1046335652")
+        assert resp.status_code == 404
+
+    def test_cancel_returns_502_on_broker_error(self, client):
+        from unittest.mock import patch, MagicMock
+        mock_broker = MagicMock()
+        mock_broker.cancel_order.return_value = {
+            "error": "Connection refused",
+            "order_id": "xyz",
+        }
+        with patch("backend.main.get_broker", return_value=mock_broker):
+            resp = client.delete("/orders/xyz")
+        assert resp.status_code == 502
+
+    def test_cancel_happy_path_updates_db_row(self, client, db_session):
+        """
+        After a successful cancel, the matching executed_orders row should
+        have status='cancelled'. This keeps order history consistent with
+        what actually happened at the broker.
+        """
+        from unittest.mock import patch, MagicMock
+        from backend.db.models import ExecutedOrder
+
+        # Seed a matching executed_orders row
+        row = ExecutedOrder(
+            alpaca_order_id="1046335652",
+            ticker="SLV",
+            side="buy",
+            qty=1.0,
+            order_type="limit",
+            status="accepted",
+            is_paper=False,
+        )
+        db_session.add(row)
+        db_session.commit()
+
+        mock_broker = MagicMock()
+        mock_broker.cancel_order.return_value = {
+            "status": "cancelled",
+            "order_id": "1046335652",
+        }
+        with patch("backend.main.get_broker", return_value=mock_broker):
+            resp = client.delete("/orders/1046335652")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "cancelled"
+
+        # DB row should now be cancelled
+        db_session.refresh(row)
+        assert row.status == "cancelled"

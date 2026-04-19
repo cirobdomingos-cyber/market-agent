@@ -136,5 +136,40 @@ class BrokerClient(ABC):
         """
 
     @abstractmethod
+    def get_pending_orders(self) -> list[dict]:
+        """
+        Return orders that are live at the broker but not yet filled or
+        cancelled — "working orders." Distinct from get_order_history,
+        which includes filled and cancelled orders too.
+
+        Each dict has the standard order shape:
+          order_id, ticker, qty, filled_qty, side, order_type, order_class,
+          status, limit_price, stop_price, submitted_at, parent_id
+
+        parent_id is non-null for bracket legs (stop-loss / take-profit)
+        so the frontend can group them under their parent entry. For
+        non-bracket orders it's None.
+
+        Returns [] when the broker isn't initialised or there are no
+        working orders. Never raises — disconnected brokers return [].
+        """
+
+    @abstractmethod
+    def cancel_order(self, order_id: str) -> dict:
+        """
+        Cancel a working order by its broker-side permanent ID (Alpaca UUID
+        or IBKR permId — whatever get_pending_orders returns as order_id).
+
+        For bracket orders, cancelling the parent auto-cancels the attached
+        OCO legs at the broker. Both Alpaca and IBKR handle this natively;
+        implementations should not attempt to cancel legs individually.
+
+        Returns:
+          {"status": "cancelled", "order_id": ...} on success
+          {"error": "...", "order_id": ...} on any failure (not found,
+          already filled, connection error, etc.)
+        """
+
+    @abstractmethod
     def close_position(self, ticker: str) -> dict:
         """Close an open position by ticker. Returns the resulting order info."""

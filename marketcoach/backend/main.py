@@ -805,6 +805,70 @@ def get_order_history(
     return client.get_order_history(limit=limit)
 
 
+@app.get("/orders/pending")
+def get_pending_orders(
+    _auth: str = Depends(require_auth),
+):
+    """
+    Return working orders (submitted but not yet filled or cancelled) from
+    the active broker. Distinct from /portfolio/orders, which is historical.
+    Used by the Portfolio page's Pending Orders section.
+    """
+    client = get_broker()
+    if client is None:
+        return []
+    return client.get_pending_orders()
+
+
+@app.delete("/orders/{order_id}")
+def cancel_pending_order(
+    order_id: str,
+    db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
+):
+    """
+    Cancel a working order by its broker-side permanent ID. For brackets,
+    cancelling the parent auto-cancels the OCO legs at the broker — we
+    don't iterate legs ourselves. Also updates the matching executed_orders
+    row to status='cancelled' so history stays consistent.
+    """
+    client = get_broker()
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Broker not configured — cannot cancel orders.",
+        )
+
+    result = client.cancel_order(order_id)
+    if "error" in result:
+        # Not-found from the broker (order already filled/cancelled) →
+        # return 404 so the frontend can distinguish "gone" from "broken".
+        if "not found" in result["error"].lower():
+            raise HTTPException(status_code=404, detail=result["error"])
+        raise HTTPException(status_code=502, detail=result["error"])
+
+    # Best-effort: mark the matching executed_orders row cancelled. The
+    # column is named alpaca_order_id for legacy reasons but holds whatever
+    # broker order ID was stored at submission time (IBKR permId for IBKR).
+    try:
+        from backend.db.models import ExecutedOrder
+        row = (
+            db.query(ExecutedOrder)
+            .filter(ExecutedOrder.alpaca_order_id == order_id)
+            .first()
+        )
+        if row is not None:
+            row.status = "cancelled"
+            db.commit()
+    except Exception as exc:
+        logger.warning(
+            "Cancel succeeded at broker but DB update failed for %s: %s",
+            order_id, exc,
+        )
+
+    return result
+
+
 # -- Order execution -----------------------------------------------------------
 #
 # Defence in depth — every layer must allow the order before it reaches the broker:
