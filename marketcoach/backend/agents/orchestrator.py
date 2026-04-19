@@ -608,6 +608,22 @@ class Orchestrator:
                 content = "\n".join(content_lines)
 
                 try:
+                    # Claim the alert atomically FIRST. If we lose the
+                    # race (another worker already triggered this alert),
+                    # skip the whole side-effects chain — no news_reactions
+                    # row, no email. Without this ordering, two overlapping
+                    # polls would produce two identical notifications for
+                    # the same alert.
+                    won_race = crud.mark_alert_triggered(
+                        self.db, alert.id, current_price,
+                    )
+                    if not won_race:
+                        logger.debug(
+                            "Alert %s already triggered — skipping duplicate notification",
+                            alert.id,
+                        )
+                        continue
+
                     crud.create_news_reaction(
                         self.db,
                         ticker=ticker,
@@ -616,7 +632,6 @@ class Orchestrator:
                         trigger_reason="price_alert",
                         status="unread",
                     )
-                    crud.mark_alert_triggered(self.db, alert.id, current_price)
                     fired += 1
                     logger.info(
                         "Price alert fired: %s %s $%.2f (current $%.2f)",
