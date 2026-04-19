@@ -343,6 +343,156 @@ def get_accuracy(db: Session = Depends(get_db)):
     return crud.get_accuracy_stats(db)
 
 
+@app.get("/performance")
+def get_performance(db: Session = Depends(get_db)):
+    """
+    Realised-trade performance stats for the Performance dashboard.
+
+    LIVE ONLY by design — paper trades are excluded because "did the
+    advisor help?" is only meaningfully answerable on real-money
+    outcomes. Paper results don't carry the psychological or execution
+    reality of a live bracket. If the user ever wants to see paper
+    retrospectives, that's a separate endpoint; not mixing them here.
+
+    Scope: closed TradeJournalEntry rows whose originating ExecutedOrder
+    row has is_paper=False. Manual trades that bypassed /orders/confirm
+    have no open_executed_order_id and are not counted — rare in
+    practice, and the alternative (trusting a detection-time is_paper
+    flag we don't currently store on the journal row) is brittle.
+
+    Returns a single JSON blob with headline KPIs + the most-recent 50
+    closed trades for the table view. Frontend computes no aggregates —
+    everything here is wire-ready.
+    """
+    from backend.db.models import TradeJournalEntry, ExecutedOrder
+
+    closed = (
+        db.query(TradeJournalEntry)
+        .join(
+            ExecutedOrder,
+            ExecutedOrder.id == TradeJournalEntry.open_executed_order_id,
+        )
+        .filter(
+            TradeJournalEntry.status == "closed",
+            TradeJournalEntry.pnl_amount.isnot(None),
+            ExecutedOrder.is_paper.is_(False),
+        )
+        .order_by(TradeJournalEntry.closed_at.desc())
+        .all()
+    )
+
+    open_count = (
+        db.query(TradeJournalEntry)
+        .join(
+            ExecutedOrder,
+            ExecutedOrder.id == TradeJournalEntry.open_executed_order_id,
+        )
+        .filter(
+            TradeJournalEntry.status == "open",
+            ExecutedOrder.is_paper.is_(False),
+        )
+        .count()
+    )
+
+    def _serialise_trade(t: TradeJournalEntry) -> dict:
+        return {
+            "id": t.id,
+            "ticker": t.ticker,
+            "side": t.side,
+            "qty": t.qty,
+            "open_price": t.open_price,
+            "close_price": t.close_price,
+            "pnl_amount": t.pnl_amount,
+            "pnl_pct": t.pnl_pct,
+            "days_held": t.days_held,
+            "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+            "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+            "advisor_session_id": t.advisor_session_id,
+            "user_thesis": (t.user_thesis or "")[:200],
+        }
+
+    if not closed:
+        # Render the dashboard with zeroes/nulls — page layout stays
+        # identical but every KPI card shows "—" until trades land.
+        return {
+            "closed_trades_count": 0,
+            "open_positions_count": open_count,
+            "winners_count": 0,
+            "losers_count": 0,
+            "win_rate_pct": None,
+            "total_realized_pnl": 0.0,
+            "avg_win_dollar": None,
+            "avg_loss_dollar": None,
+            "largest_win": None,
+            "largest_loss": None,
+            "profit_factor": None,
+            "avg_hold_days": None,
+            "advised_trades_count": 0,
+            "advised_win_rate_pct": None,
+            "recent_trades": [],
+        }
+
+    winners = [t for t in closed if t.pnl_amount > 0]
+    losers = [t for t in closed if t.pnl_amount < 0]
+    # Zero-pnl trades (very rare, usually a breakeven exit on the runner
+    # after T1 fill) count toward total but not toward winners/losers.
+
+    n = len(closed)
+    n_winners = len(winners)
+    n_losers = len(losers)
+
+    gross_wins = sum(t.pnl_amount for t in winners) if winners else 0.0
+    gross_losses = sum(abs(t.pnl_amount) for t in losers) if losers else 0.0
+
+    # Attribution — were the advisor's trades better or worse?
+    advised = [t for t in closed if t.advisor_session_id]
+    advised_winners = [t for t in advised if t.pnl_amount > 0]
+
+    hold_days = [t.days_held for t in closed if t.days_held is not None]
+
+    return {
+        "closed_trades_count": n,
+        "open_positions_count": open_count,
+        "winners_count": n_winners,
+        "losers_count": n_losers,
+        # Win rate treats breakeven trades as neither — denominator
+        # is all closed trades, so a 50/50 split with 0 breakevens
+        # shows 50%, but a 50/49/1 split shows 50% too. Intentional:
+        # breakevens are a separate category (it's a win to not lose).
+        "win_rate_pct": round(n_winners / n * 100, 1),
+        "total_realized_pnl": round(sum(t.pnl_amount for t in closed), 2),
+        "avg_win_dollar": (
+            round(gross_wins / n_winners, 2) if n_winners else None
+        ),
+        "avg_loss_dollar": (
+            round(-gross_losses / n_losers, 2) if n_losers else None
+        ),
+        "largest_win": (
+            round(max(t.pnl_amount for t in winners), 2)
+            if winners else None
+        ),
+        "largest_loss": (
+            round(min(t.pnl_amount for t in losers), 2)
+            if losers else None
+        ),
+        # Profit factor = gross wins / gross losses. Above 1 is
+        # profitable, above 2 is excellent. Undefined when no losers
+        # (statistically meaningless with a tiny sample anyway).
+        "profit_factor": (
+            round(gross_wins / gross_losses, 2) if gross_losses > 0 else None
+        ),
+        "avg_hold_days": (
+            round(sum(hold_days) / len(hold_days), 1) if hold_days else None
+        ),
+        "advised_trades_count": len(advised),
+        "advised_win_rate_pct": (
+            round(len(advised_winners) / len(advised) * 100, 1)
+            if advised else None
+        ),
+        "recent_trades": [_serialise_trade(t) for t in closed[:50]],
+    }
+
+
 @app.post("/pipeline/run", response_model=PipelineRunResponse)
 def run_pipeline(
     db: Session = Depends(get_db),
