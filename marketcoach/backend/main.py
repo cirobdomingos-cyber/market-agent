@@ -88,11 +88,11 @@ async def lifespan(app: FastAPI):
     finally:
         _seed_db.close()
 
-    # Initialize the broker singleton. Provider is chosen by settings.broker_provider
-    # ("alpaca" | "ibkr"). Trading mode is gated by the same dual switch regardless
-    # of provider: alpaca_paper=False is not enough — the confirmation phrase must
-    # also be set. If the user sets paper=False without the phrase, we refuse to
-    # start in live mode and fall back to paper with a loud warning.
+    # Initialize the broker singleton. Provider is chosen by settings.broker_provider.
+    # Trading mode is gated by the same dual switch regardless of provider:
+    # alpaca_paper=False is not enough — the confirmation phrase must also be
+    # set. If the user sets paper=False without the phrase, we refuse to start
+    # in live mode and fall back to paper with a loud warning.
     is_live = settings.is_live_mode
     if settings.alpaca_paper is False and not is_live:
         logger.warning(
@@ -103,20 +103,7 @@ async def lifespan(app: FastAPI):
         )
 
     provider = settings.broker_provider.lower().strip()
-    if provider == "alpaca":
-        if settings.alpaca_api_key and settings.alpaca_secret_key:
-            init_broker(
-                "alpaca",
-                api_key=settings.alpaca_api_key,
-                secret_key=settings.alpaca_secret_key,
-                paper=not is_live,
-            )
-        else:
-            logger.warning(
-                "BROKER_PROVIDER=alpaca but ALPACA_API_KEY/ALPACA_SECRET_KEY are "
-                "not set. Broker features disabled until you add credentials."
-            )
-    elif provider == "ibkr":
+    if provider == "ibkr":
         init_broker(
             "ibkr",
             host=settings.ibkr_host,
@@ -130,6 +117,18 @@ async def lifespan(app: FastAPI):
         # etc.). Analysis features work normally; trading endpoints return
         # "disconnected". Factory logs its own info line when this hits.
         init_broker("none")
+    elif provider == "alpaca":
+        # Explicit error rather than a silent fallback. Anyone still setting
+        # BROKER_PROVIDER=alpaca from a pre-removal .env should see the
+        # message and switch rather than get confusing behaviour.
+        logger.error(
+            "BROKER_PROVIDER=alpaca is no longer supported. The Alpaca "
+            "integration was removed because Alpaca doesn't onboard "
+            "Brazilian residents for live trading. Set BROKER_PROVIDER=ibkr "
+            "for Interactive Brokers, or BROKER_PROVIDER=none to disable "
+            "broker features entirely. Startup will continue with broker "
+            "features disabled until you update .env."
+        )
     else:
         logger.warning(
             "Unknown BROKER_PROVIDER='%s'. Broker features disabled.",
@@ -1041,10 +1040,10 @@ def confirm_order(
         raise HTTPException(
             status_code=503,
             detail=(
-                "Broker not configured. For Alpaca, set ALPACA_API_KEY and "
-                "ALPACA_SECRET_KEY. For IBKR, start IB Gateway and set "
+                "Broker not configured. Start IB Gateway and set "
                 "BROKER_PROVIDER=ibkr. This environment may be running with "
-                "BROKER_PROVIDER=none (trading disabled)."
+                "BROKER_PROVIDER=none (trading disabled by design, e.g. "
+                "cloud-hosted analysis)."
             ),
         )
 
