@@ -348,3 +348,206 @@ class TestPerformanceEquityCurve:
         curve = client.get("/performance").json()["equity_curve"]
         assert len(curve) == 1
         assert curve[0]["ticker"] == "LIVE"
+
+
+class TestPerformanceSpyBenchmark:
+    """
+    SPY benchmark series answers "did active trading actually beat
+    buy-and-hold SPY over the same windows?" Computed per-trade as
+    "notional * (SPY close-at-trade-close / SPY close-at-trade-open - 1)"
+    and cumulatively summed — apples-to-apples with the realised P&L
+    curve which runs on the same windows and same capital.
+    """
+
+    def _mock_spy_closes(self, mapping: dict):
+        """Patch the module-level cache directly so tests don't hit yfinance."""
+        from datetime import datetime, timezone
+
+        from backend.main import _SPY_CACHE
+        _SPY_CACHE["fetched_at"] = datetime.now(timezone.utc)
+        _SPY_CACHE["closes"] = mapping
+
+    def _reset_spy_cache(self):
+        from backend.main import _SPY_CACHE
+        _SPY_CACHE["fetched_at"] = None
+        _SPY_CACHE["closes"] = {}
+
+    def test_empty_benchmark_on_no_trades(self, client):
+        self._reset_spy_cache()
+        body = client.get("/performance").json()
+        assert body["spy_benchmark"] == []
+
+    def test_benchmark_excluded_when_yfinance_fails(self, client, db):
+        """
+        yfinance unreachable → the page still renders, just without the
+        comparison line. Benchmark defaults to [] rather than crashing
+        the whole endpoint.
+        """
+        self._reset_spy_cache()
+        _seed_trade(
+            db, "NVDA", 10, 100.0, 110.0,
+            pnl=100.0, pnl_pct=10.0, days_held=1,
+        )
+        from unittest.mock import patch as _patch
+        with _patch("backend.main._fetch_spy_closes", return_value={}):
+            body = client.get("/performance").json()
+        assert body["spy_benchmark"] == []
+        # Real equity curve still computes
+        assert len(body["equity_curve"]) == 1
+
+    def test_benchmark_cumulative_with_known_spy_series(self, client, db):
+        """
+        Two closed trades against a fabricated SPY series with known
+        returns. Verifies the per-trade math and the cumulative running
+        sum end-to-end.
+        """
+        now = datetime.now(timezone.utc)
+        # Trade 1: opened 10d ago, closed 5d ago. SPY went 400 → 420 (+5%).
+        t1_open = now - timedelta(days=10)
+        t1_close = now - timedelta(days=5)
+        # Trade 2: opened 3d ago, closed 1d ago. SPY went 420 → 410 (-2.38%).
+        t2_open = now - timedelta(days=3)
+        t2_close = now - timedelta(days=1)
+
+        _seed_trade(
+            db, "NVDA", 10, 100.0, 120.0,
+            pnl=200.0, pnl_pct=20.0, days_held=5,
+            opened_at=t1_open, closed_at=t1_close,
+        )
+        _seed_trade(
+            db, "SPY", 5, 200.0, 190.0,
+            pnl=-50.0, pnl_pct=-5.0, days_held=2,
+            opened_at=t2_open, closed_at=t2_close,
+        )
+
+        self._mock_spy_closes({
+            t1_open.date().isoformat(): 400.0,
+            t1_close.date().isoformat(): 420.0,
+            t2_open.date().isoformat(): 420.0,
+            t2_close.date().isoformat(): 410.0,
+        })
+
+        body = client.get("/performance").json()
+        bench = body["spy_benchmark"]
+        assert len(bench) == 2
+
+        # Trade 1: notional = 10 * 100 = 1000; SPY +5% → +50
+        assert bench[0]["trade_spy_pnl"] == pytest.approx(50.0, abs=0.01)
+        assert bench[0]["cumulative_spy_pnl"] == pytest.approx(50.0, abs=0.01)
+
+        # Trade 2: notional = 5 * 200 = 1000; SPY -2.381% → ~-23.81
+        # Cumulative: 50 - 23.81 = 26.19
+        assert bench[1]["trade_spy_pnl"] == pytest.approx(-23.81, abs=0.05)
+        assert bench[1]["cumulative_spy_pnl"] == pytest.approx(26.19, abs=0.05)
+
+    def test_weekend_close_dates_resolve_to_prior_trading_day(self, client, db):
+        """
+        Weekend/holiday dates aren't in the SPY series. The helper walks
+        back up to 7 days to find the most recent trading day. Without
+        this, weekend-closed trades would silently drop from the benchmark.
+        """
+        now = datetime.now(timezone.utc)
+        t_open = now - timedelta(days=10)
+        t_close = now - timedelta(days=3)
+
+        _seed_trade(
+            db, "NVDA", 10, 100.0, 110.0,
+            pnl=100.0, pnl_pct=10.0, days_held=7,
+            opened_at=t_open, closed_at=t_close,
+        )
+
+        # Only the open date + a date 2 days before the close are in the
+        # series. The walk-back should resolve the close to that earlier
+        # trading day.
+        self._mock_spy_closes({
+            t_open.date().isoformat(): 400.0,
+            (t_close - timedelta(days=2)).date().isoformat(): 420.0,
+        })
+
+        bench = client.get("/performance").json()["spy_benchmark"]
+        assert len(bench) == 1
+        assert bench[0]["trade_spy_pnl"] != 0
+
+    def test_benchmark_skips_trade_with_missing_spy_data(self, client, db):
+        """
+        One trade with coverage + one trade with dates outside the SPY
+        series → benchmark has the one, skips the other, never crashes.
+        """
+        now = datetime.now(timezone.utc)
+        t1_open = now - timedelta(days=10)
+        t1_close = now - timedelta(days=5)
+        t2_open = now - timedelta(days=300)
+        t2_close = now - timedelta(days=295)
+
+        _seed_trade(
+            db, "HAS_DATA", 10, 100.0, 110.0,
+            pnl=100.0, pnl_pct=10.0, days_held=5,
+            opened_at=t1_open, closed_at=t1_close,
+        )
+        _seed_trade(
+            db, "NO_DATA", 10, 100.0, 110.0,
+            pnl=100.0, pnl_pct=10.0, days_held=5,
+            opened_at=t2_open, closed_at=t2_close,
+        )
+
+        self._mock_spy_closes({
+            t1_open.date().isoformat(): 400.0,
+            t1_close.date().isoformat(): 420.0,
+        })
+
+        bench = client.get("/performance").json()["spy_benchmark"]
+        assert len(bench) == 1
+        assert bench[0]["ticker"] == "HAS_DATA"
+
+    def test_benchmark_excludes_paper_trades(self, client, db):
+        """Live-only filter applies to the SPY benchmark too."""
+        now = datetime.now(timezone.utc)
+        t1_open = now - timedelta(days=5)
+        t1_close = now - timedelta(days=1)
+
+        _seed_trade(
+            db, "LIVE", 10, 100.0, 110.0,
+            pnl=100.0, pnl_pct=10.0, days_held=4,
+            opened_at=t1_open, closed_at=t1_close,
+            is_paper=False,
+        )
+        _seed_trade(
+            db, "PAPER", 10, 100.0, 200.0,
+            pnl=1000.0, pnl_pct=100.0, days_held=4,
+            opened_at=t1_open, closed_at=t1_close,
+            is_paper=True,
+        )
+
+        self._mock_spy_closes({
+            t1_open.date().isoformat(): 400.0,
+            t1_close.date().isoformat(): 420.0,
+        })
+
+        bench = client.get("/performance").json()["spy_benchmark"]
+        assert len(bench) == 1
+        assert bench[0]["ticker"] == "LIVE"
+
+
+class TestSpyCloseResolver:
+    """Direct tests of the _spy_close_on_or_before walk-back helper."""
+
+    def test_exact_match(self):
+        from backend.main import _spy_close_on_or_before
+        closes = {"2026-04-15": 500.0, "2026-04-14": 498.0}
+        assert _spy_close_on_or_before("2026-04-15", closes) == 500.0
+
+    def test_walks_back_to_prior_trading_day(self):
+        from backend.main import _spy_close_on_or_before
+        # Saturday 2026-04-18 not in series; should resolve to Friday
+        closes = {"2026-04-17": 500.0, "2026-04-16": 495.0}
+        assert _spy_close_on_or_before("2026-04-18", closes) == 500.0
+
+    def test_returns_none_when_no_match_within_window(self):
+        from backend.main import _spy_close_on_or_before
+        # Date is 100+ days after anything in the series — give up
+        closes = {"2026-01-01": 500.0}
+        assert _spy_close_on_or_before("2026-04-15", closes) is None
+
+    def test_invalid_date_string_returns_none(self):
+        from backend.main import _spy_close_on_or_before
+        assert _spy_close_on_or_before("not-a-date", {"2026-04-15": 500.0}) is None
