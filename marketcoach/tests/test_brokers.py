@@ -292,3 +292,95 @@ class TestIBKRBroker:
             action="BUY", totalQuantity=5, lmtPrice=123.45
         )
         market_order_mock.assert_not_called()
+
+
+# ── Pending orders + cancel ──────────────────────────────────────────────────
+
+class TestPendingOrdersAndCancel:
+    """
+    New broker ABC methods: get_pending_orders() and cancel_order(). Covers
+    disconnected behaviour (never raise, return empty/error dict), plus the
+    IBKR cancel happy path via a mocked IB instance.
+    """
+
+    def test_alpaca_disconnected_get_pending_returns_empty(self):
+        b = AlpacaBroker(api_key="", secret_key="", paper=True)
+        assert b.get_pending_orders() == []
+
+    def test_alpaca_disconnected_cancel_returns_error(self):
+        b = AlpacaBroker(api_key="", secret_key="", paper=True)
+        result = b.cancel_order("abc-123")
+        assert "error" in result
+        assert result["order_id"] == "abc-123"
+
+    def test_ibkr_disconnected_get_pending_returns_empty(self):
+        b = IBKRBroker()
+        assert b.get_pending_orders() == []
+
+    def test_ibkr_disconnected_cancel_returns_error(self):
+        b = IBKRBroker()
+        result = b.cancel_order("123456")
+        assert "error" in result
+        assert result["order_id"] == "123456"
+
+    def test_ibkr_cancel_not_found_returns_clear_error(self):
+        """
+        Cancelling an orderId that isn't among openTrades must return a
+        specific not-found error so the endpoint can map it to HTTP 404
+        (meaning "already filled/cancelled" — the safer interpretation).
+        """
+        from unittest.mock import AsyncMock
+
+        b = IBKRBroker(paper=True)
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.openTrades.return_value = []  # no working orders
+        fake_ib.cancelOrder = MagicMock()
+        b._ib = fake_ib
+
+        result = b.cancel_order("99999")
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+        fake_ib.cancelOrder.assert_not_called()
+
+    def test_ibkr_cancel_calls_cancelOrder_on_matched_trade(self):
+        """Happy path: found a matching trade by permId, called cancelOrder."""
+        from unittest.mock import AsyncMock
+
+        b = IBKRBroker(paper=True)
+
+        fake_order = SimpleNamespace(permId=1046335652, orderId=9)
+        fake_status = SimpleNamespace(status="Cancelled")
+        fake_trade = SimpleNamespace(order=fake_order, orderStatus=fake_status, log=[])
+
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.openTrades.return_value = [fake_trade]
+        fake_ib.cancelOrder = MagicMock()
+        b._ib = fake_ib
+
+        result = b.cancel_order("1046335652")
+        assert result["status"] == "cancelled"
+        assert result["order_id"] == "1046335652"
+        fake_ib.cancelOrder.assert_called_once_with(fake_order)
+
+    def test_ibkr_cancel_falls_back_to_orderId_when_permId_missing(self):
+        """
+        Pre-session-persistence flows may only have orderId (permId set
+        after the first TWS ack). Must still match on orderId.
+        """
+        b = IBKRBroker(paper=True)
+
+        fake_order = SimpleNamespace(permId=None, orderId=42)
+        fake_status = SimpleNamespace(status="Cancelled")
+        fake_trade = SimpleNamespace(order=fake_order, orderStatus=fake_status, log=[])
+
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.openTrades.return_value = [fake_trade]
+        fake_ib.cancelOrder = MagicMock()
+        b._ib = fake_ib
+
+        result = b.cancel_order("42")
+        assert result["status"] == "cancelled"
+        fake_ib.cancelOrder.assert_called_once_with(fake_order)

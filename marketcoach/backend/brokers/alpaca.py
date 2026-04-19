@@ -286,6 +286,59 @@ class AlpacaBroker(BrokerClient):
                 is_paper=self.paper,
             )
 
+    def get_pending_orders(self) -> list[dict]:
+        if self._client is None:
+            return []
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+
+            request = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)
+            orders = self._client.get_orders(filter=request)
+            return [
+                {
+                    "order_id": str(order.id),
+                    "ticker": order.symbol,
+                    "qty": float(order.qty) if order.qty else None,
+                    "filled_qty": float(order.filled_qty) if order.filled_qty else 0,
+                    "side": order.side.value,
+                    "order_type": order.type.value,
+                    "order_class": (
+                        order.order_class.value if order.order_class else "simple"
+                    ),
+                    "status": order.status.value,
+                    "limit_price": (
+                        float(order.limit_price) if order.limit_price else None
+                    ),
+                    "stop_price": (
+                        float(order.stop_price) if order.stop_price else None
+                    ),
+                    "submitted_at": (
+                        str(order.submitted_at) if order.submitted_at else None
+                    ),
+                    "parent_id": (
+                        str(order.legs[0].id)
+                        if getattr(order, "legs", None)
+                        else None
+                    ),
+                }
+                for order in orders
+            ]
+        except Exception as exc:
+            logger.error("Alpaca get_pending_orders failed: %s", exc)
+            return []
+
+    def cancel_order(self, order_id: str) -> dict:
+        if self._client is None:
+            return {"error": "Alpaca not configured", "order_id": order_id}
+        try:
+            self._client.cancel_order_by_id(order_id)
+            logger.info("Alpaca cancelled order: %s (paper=%s)", order_id, self.paper)
+            return {"status": "cancelled", "order_id": order_id}
+        except Exception as exc:
+            logger.error("Alpaca cancel_order failed for %s: %s", order_id, exc)
+            return {"error": str(exc), "order_id": order_id}
+
     def close_position(self, ticker: str) -> dict:
         if self._client is None:
             return {"error": "Alpaca not configured"}

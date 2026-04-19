@@ -22,6 +22,8 @@ export default function Portfolio() {
   const [newAlertPrice, setNewAlertPrice] = useState('')
   const [newAlertNote, setNewAlertNote] = useState('')
   const [alertError, setAlertError] = useState(null)
+  const [pendingOrders, setPendingOrders] = useState([])
+  const [cancellingOrderId, setCancellingOrderId] = useState(null)
 
   const fetchWatchlist = async () => {
     try {
@@ -111,16 +113,47 @@ export default function Portfolio() {
     }
   }
 
+  const fetchPendingOrders = async () => {
+    try {
+      const res = await axios.get(`${API}/orders/pending`)
+      setPendingOrders(res.data || [])
+    } catch (err) {
+      // Silent — broker may be disconnected. UI will show empty state.
+      setPendingOrders([])
+    }
+  }
+
+  const cancelOrder = async (order) => {
+    const label = `${order.side.toUpperCase()} ${order.qty} ${order.ticker}` +
+      (order.limit_price ? ` @ $${order.limit_price.toFixed(2)}` : '')
+    if (!confirm(`Cancel this pending order?\n\n${label}`)) return
+    setCancellingOrderId(order.order_id)
+    try {
+      await axios.delete(`${API}/orders/${order.order_id}`)
+      await fetchPendingOrders()
+    } catch (err) {
+      const detail = err.response?.data?.detail
+      alert(
+        `Cancel failed:\n\n${
+          typeof detail === 'string' ? detail : 'Unknown error'
+        }`
+      )
+    } finally {
+      setCancellingOrderId(null)
+    }
+  }
+
   useEffect(() => {
     let cancelled = false
     async function fetchData() {
       try {
-        const [portRes, ordRes, accRes, wlRes, alRes] = await Promise.all([
+        const [portRes, ordRes, accRes, wlRes, alRes, pendRes] = await Promise.all([
           axios.get(`${API}/portfolio`).catch(() => ({ data: null })),
           axios.get(`${API}/portfolio/orders`).catch(() => ({ data: [] })),
           axios.get(`${API}/accuracy`),
           axios.get(`${API}/watchlist`).catch(() => ({ data: [] })),
           axios.get(`${API}/alerts`).catch(() => ({ data: [] })),
+          axios.get(`${API}/orders/pending`).catch(() => ({ data: [] })),
         ])
         if (cancelled) return
         setPortfolio(portRes.data)
@@ -128,6 +161,7 @@ export default function Portfolio() {
         setAccuracy(accRes.data)
         setWatchlist(wlRes.data || [])
         setAlerts(alRes.data || [])
+        setPendingOrders(pendRes.data || [])
       } catch (err) {
         console.error('Failed to load portfolio:', err)
       } finally {
@@ -451,6 +485,102 @@ export default function Portfolio() {
           </div>
         )}
       </div>
+
+      {/* Pending Orders — working orders at the broker that haven't filled
+          or been cancelled. Brackets are grouped: the parent entry row
+          shows a "BRACKET" badge and its stop/target in subtext; the two
+          child legs are hidden from this list (cancelling the parent
+          auto-cancels them at the broker). */}
+      {pendingOrders.length > 0 && (() => {
+        // Group: only render rows whose parent_id is null (parents + solos).
+        // Map of parent_id → [legs] so we can surface stop/target inline.
+        const legsByParent = {}
+        for (const o of pendingOrders) {
+          if (o.parent_id) {
+            (legsByParent[o.parent_id] ||= []).push(o)
+          }
+        }
+        const rootRows = pendingOrders.filter((o) => !o.parent_id)
+        return (
+          <div>
+            <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
+              Pending Orders ({rootRows.length})
+            </h2>
+            <div className="border border-gray-800 rounded-lg overflow-hidden">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-900 text-gray-400">
+                  <tr>
+                    <th className="text-left px-4 py-2">Ticker</th>
+                    <th className="text-left px-4 py-2">Side</th>
+                    <th className="text-right px-4 py-2">Qty</th>
+                    <th className="text-left px-4 py-2">Type</th>
+                    <th className="text-right px-4 py-2">Price</th>
+                    <th className="text-left px-4 py-2">Status</th>
+                    <th className="text-right px-4 py-2"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rootRows.map((o) => {
+                    const legs = legsByParent[o.order_id] || []
+                    const sl = legs.find((l) => l.order_type === 'stop')
+                    const tp = legs.find((l) => l.order_type === 'limit')
+                    const isBracket = o.order_class === 'bracket' || legs.length > 0
+                    const price = o.limit_price ?? o.stop_price
+                    return (
+                      <tr key={o.order_id} className="border-t border-gray-800">
+                        <td className="px-4 py-2 font-mono font-semibold">
+                          {o.ticker}
+                          {isBracket && (
+                            <span className="ml-2 text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-900/60 text-indigo-300">
+                              BRACKET
+                            </span>
+                          )}
+                          {isBracket && (sl || tp) && (
+                            <div className="text-xs text-gray-500 font-mono mt-0.5">
+                              {sl && `SL $${sl.stop_price?.toFixed(2) ?? '—'}`}
+                              {sl && tp && ' · '}
+                              {tp && `TP $${tp.limit_price?.toFixed(2) ?? '—'}`}
+                            </div>
+                          )}
+                        </td>
+                        <td
+                          className={`px-4 py-2 uppercase text-xs font-mono ${
+                            o.side === 'buy' ? 'text-emerald-400' : 'text-rose-400'
+                          }`}
+                        >
+                          {o.side}
+                        </td>
+                        <td className="px-4 py-2 text-right font-mono">{o.qty}</td>
+                        <td className="px-4 py-2 font-mono uppercase text-xs text-gray-400">
+                          {o.order_type}
+                        </td>
+                        <td className="px-4 py-2 text-right font-mono">
+                          {price != null ? `$${price.toFixed(2)}` : '—'}
+                        </td>
+                        <td className="px-4 py-2 text-xs text-gray-400">
+                          {o.status}
+                        </td>
+                        <td className="px-4 py-2 text-right">
+                          <button
+                            onClick={() => cancelOrder(o)}
+                            disabled={cancellingOrderId === o.order_id}
+                            className="px-3 py-1 text-xs bg-rose-700 hover:bg-rose-600 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded transition"
+                          >
+                            {cancellingOrderId === o.order_id ? 'Cancelling…' : 'Cancel'}
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-2 text-xs text-gray-500">
+              Cancelling a bracket parent auto-cancels the stop and target legs at the broker.
+            </p>
+          </div>
+        )
+      })()}
 
       {/* Order History */}
       {orders.length > 0 && (

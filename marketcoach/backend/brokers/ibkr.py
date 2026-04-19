@@ -548,6 +548,127 @@ class IBKRBroker(BrokerClient):
                 is_paper=self.paper,
             )
 
+    def get_pending_orders(self) -> list[dict]:
+        """
+        Return IBKR working orders — anything not yet filled or cancelled.
+        Uses openTrades() which returns Trade objects with their live
+        OrderStatus attached. For brackets, each leg (parent + stop +
+        take-profit) appears as its own row; parent_id is set on legs so
+        the frontend can group them under the parent.
+        """
+        if not self._ensure_connected():
+            return []
+
+        async def _do():
+            return list(self._ib.openTrades())
+
+        try:
+            trades = _run_on_broker_loop(_do(), timeout=5.0)
+            results = []
+            for t in trades:
+                order = t.order
+                contract = t.contract
+                status = t.orderStatus.status if t.orderStatus else "Unknown"
+                filled_qty = (
+                    float(t.orderStatus.filled) if t.orderStatus else 0.0
+                )
+                submitted_at = str(t.log[0].time) if t.log else ""
+                # Non-zero parentId means this is a bracket leg. Use permId
+                # if set (stable) else fall back to orderId (session-local).
+                parent_id = None
+                if order.parentId and order.parentId != 0:
+                    parent_id = str(order.parentId)
+                # Normalise orderType to match Alpaca's lowercase ('limit',
+                # 'market', 'stop') so the frontend sees one shape.
+                ot = (order.orderType or "").upper()
+                if ot == "LMT":
+                    order_type = "limit"
+                elif ot == "MKT":
+                    order_type = "market"
+                elif ot == "STP":
+                    order_type = "stop"
+                else:
+                    order_type = ot.lower()
+                # Bracket detection: IBKR doesn't flag order_class natively,
+                # but any order with a parentId is a leg, and any order with
+                # ocaGroup set is part of an OCO group.
+                order_class = (
+                    "bracket"
+                    if (parent_id or getattr(order, "ocaGroup", None))
+                    else "simple"
+                )
+
+                results.append({
+                    "order_id": str(order.permId or order.orderId),
+                    "ticker": contract.symbol,
+                    "qty": float(order.totalQuantity) if order.totalQuantity else None,
+                    "filled_qty": filled_qty,
+                    "side": "buy" if order.action == "BUY" else "sell",
+                    "order_type": order_type,
+                    "order_class": order_class,
+                    "status": status.lower(),
+                    "limit_price": (
+                        float(order.lmtPrice)
+                        if getattr(order, "lmtPrice", 0)
+                        else None
+                    ),
+                    "stop_price": (
+                        float(order.auxPrice)
+                        if getattr(order, "auxPrice", 0)
+                        else None
+                    ),
+                    "submitted_at": submitted_at,
+                    "parent_id": parent_id,
+                })
+            return results
+        except Exception as exc:
+            logger.error("IBKR get_pending_orders failed: %s", exc)
+            return []
+
+    def cancel_order(self, order_id: str) -> dict:
+        """
+        Cancel a working order by its permId (or orderId as fallback).
+        ib_insync's cancelOrder takes an Order object, not an ID, so we
+        first resolve the ID to a Trade via openTrades() and then cancel
+        its .order. For brackets, cancelling the parent auto-cancels the
+        OCO legs at TWS — we don't iterate legs ourselves.
+        """
+        if not self._ensure_connected():
+            return {"error": "IBKR not configured", "order_id": order_id}
+
+        async def _do():
+            trades = list(self._ib.openTrades())
+            target = None
+            for t in trades:
+                pid = str(t.order.permId) if t.order.permId else None
+                oid = str(t.order.orderId) if t.order.orderId else None
+                if order_id in (pid, oid):
+                    target = t
+                    break
+            if target is None:
+                return {"_not_found": True}
+            self._ib.cancelOrder(target.order)
+            # Brief wait to let TWS emit the Cancelled status before we log
+            await asyncio.sleep(1.0)
+            return {"_status": target.orderStatus.status if target.orderStatus else "Unknown"}
+
+        try:
+            result = _run_on_broker_loop(_do(), timeout=10.0)
+            if result.get("_not_found"):
+                return {
+                    "error": f"Order {order_id} not found among open trades. "
+                             "It may have already filled or been cancelled.",
+                    "order_id": order_id,
+                }
+            logger.info(
+                "IBKR cancel submitted for order %s (status=%s, paper=%s)",
+                order_id, result.get("_status"), self.paper,
+            )
+            return {"status": "cancelled", "order_id": order_id}
+        except Exception as exc:
+            logger.error("IBKR cancel_order failed for %s: %s", order_id, exc)
+            return {"error": str(exc), "order_id": order_id}
+
     def close_position(self, ticker: str) -> dict:
         if not self._ensure_connected():
             return {"error": "IBKR not configured"}
