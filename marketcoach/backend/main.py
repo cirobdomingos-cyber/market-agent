@@ -430,6 +430,7 @@ def get_performance(db: Session = Depends(get_db)):
             "advised_win_rate_pct": None,
             "recent_trades": [],
             "equity_curve": [],
+            "spy_benchmark": [],
         }
 
     winners = [t for t in closed if t.pnl_amount > 0]
@@ -496,6 +497,12 @@ def get_performance(db: Session = Depends(get_db)):
         # after that trade closed. No fills between trades — the line
         # only steps when something actually realises P&L.
         "equity_curve": _build_equity_curve(closed),
+        # Parallel benchmark series: "what would the same notional have
+        # done in SPY over the same windows?" Apples-to-apples answer to
+        # "is my active trading actually beating buy-and-hold?" Empty
+        # list when yfinance is unreachable or no closed trades exist;
+        # the frontend then just hides the overlay line.
+        "spy_benchmark": _build_spy_benchmark(closed),
     }
 
 
@@ -520,6 +527,116 @@ def _build_equity_curve(closed: list) -> list[dict]:
             "x": (t.closed_at or t.opened_at).isoformat(),
             "cumulative_pnl": round(running, 2),
             "trade_pnl": round(t.pnl_amount, 2),
+            "ticker": t.ticker,
+        })
+    return points
+
+
+# Module-level SPY close cache. Same daily series gets fetched from
+# yfinance repeatedly otherwise — one Performance dashboard load does
+# one fetch and subsequent polls reuse the series for 6 hours.
+_SPY_CACHE: dict = {"fetched_at": None, "closes": {}}
+_SPY_CACHE_TTL_HOURS = 6
+
+
+def _fetch_spy_closes(earliest_date) -> dict:
+    """
+    Return a {date_str -> close_price} dict of SPY daily closes from
+    earliest_date through today. Cached at module level to avoid
+    refetching on every /performance request — the dashboard
+    auto-refreshes every 60s.
+
+    Returns {} on any yfinance failure so the benchmark degrades
+    gracefully to "no benchmark line" rather than breaking the page.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    cached_at = _SPY_CACHE.get("fetched_at")
+    if cached_at is not None:
+        if (now - cached_at) < timedelta(hours=_SPY_CACHE_TTL_HOURS):
+            return _SPY_CACHE["closes"]
+
+    try:
+        import yfinance as yf
+        # Pull from a few days before the earliest trade so forward-fill
+        # can resolve a trade that opened on a weekend/holiday.
+        start = (earliest_date - timedelta(days=7)).date().isoformat()
+        ticker = yf.Ticker("SPY")
+        hist = ticker.history(start=start, auto_adjust=True)
+        if hist.empty:
+            return {}
+        closes = {
+            idx.date().isoformat(): float(row["Close"])
+            for idx, row in hist.iterrows()
+        }
+        _SPY_CACHE["fetched_at"] = now
+        _SPY_CACHE["closes"] = closes
+        return closes
+    except Exception as exc:
+        logger.warning("SPY benchmark fetch failed: %s", exc)
+        return {}
+
+
+def _spy_close_on_or_before(date_iso: str, closes: dict) -> float | None:
+    """
+    Resolve SPY's close for a specific date, walking back up to 7 days
+    if the exact date was a weekend or market holiday (forward-fill from
+    the last trading day). Returns None if no match within the window.
+    """
+    from datetime import date, timedelta
+
+    try:
+        d = date.fromisoformat(date_iso)
+    except (TypeError, ValueError):
+        return None
+    for offset in range(8):
+        key = (d - timedelta(days=offset)).isoformat()
+        if key in closes:
+            return closes[key]
+    return None
+
+
+def _build_spy_benchmark(closed: list) -> list[dict]:
+    """
+    Parallel to _build_equity_curve but for the SPY comparison: for each
+    closed trade, compute what the same dollar notional would have
+    earned if held in SPY from the trade's open date to its close date.
+    Cumulative sum gives the "buy-and-hold SPY with the same capital,
+    same windows" benchmark.
+
+    This is the fair apples-to-apples comparison. Alternatives like
+    "dollar-cost-average SPY continuously" aren't honest: the trader
+    had capital deployed in specific windows, not continuously.
+
+    Returns [] if yfinance is unreachable or no trades have valid
+    open/close dates. Frontend hides the overlay when the list is empty.
+    """
+    by_close = sorted(closed, key=lambda t: t.closed_at or t.opened_at)
+    valid = [t for t in by_close if t.opened_at and t.closed_at]
+    if not valid:
+        return []
+
+    earliest = min(t.opened_at for t in valid)
+    closes = _fetch_spy_closes(earliest)
+    if not closes:
+        return []
+
+    running = 0.0
+    points = []
+    for t in valid:
+        spy_open = _spy_close_on_or_before(t.opened_at.date().isoformat(), closes)
+        spy_close = _spy_close_on_or_before(t.closed_at.date().isoformat(), closes)
+        if spy_open is None or spy_close is None or spy_open <= 0:
+            continue
+        notional = float(t.qty) * float(t.open_price)
+        spy_return = (spy_close / spy_open) - 1.0
+        trade_spy_pnl = notional * spy_return
+        running += trade_spy_pnl
+        points.append({
+            "x": t.closed_at.isoformat(),
+            "cumulative_spy_pnl": round(running, 2),
+            "trade_spy_pnl": round(trade_spy_pnl, 2),
             "ticker": t.ticker,
         })
     return points

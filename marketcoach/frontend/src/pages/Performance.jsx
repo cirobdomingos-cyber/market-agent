@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import {
   AreaChart,
   Area,
+  Line,
+  Legend,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -89,32 +91,77 @@ export default function Performance() {
 
       <HeroKpiRow data={data} />
       <SecondaryKpiRow data={data} />
-      <EquityCurveChart points={data.equity_curve} />
+      <EquityCurveChart
+        points={data.equity_curve}
+        spyBenchmark={data.spy_benchmark}
+      />
       <AdvisorAttributionCard data={data} />
       <RecentTradesTable trades={data.recent_trades} />
     </div>
   )
 }
 
-function EquityCurveChart({ points }) {
-  if (!points || points.length === 0) {
+function EquityCurveChart({ points, spyBenchmark }) {
+  // Merge the equity curve with the SPY benchmark by x-date.
+  // spy_benchmark may be shorter than equity_curve (yfinance coverage
+  // gaps, weekends outside the walk-back window), so indexing by
+  // position would misalign. Matching by x keeps the two series honest.
+  const chartData = useMemo(() => {
+    if (!points || points.length === 0) return []
+    const spyByX = Object.fromEntries(
+      (spyBenchmark ?? []).map((p) => [p.x, p.cumulative_spy_pnl]),
+    )
+    return points.map((pt) => ({
+      ...pt,
+      cumulative_spy_pnl:
+        spyByX[pt.x] !== undefined ? spyByX[pt.x] : null,
+    }))
+  }, [points, spyBenchmark])
+
+  if (chartData.length === 0) {
     return null  // hero cards already show "0 closed trades" — don't double up
   }
-  // Color the chart by the sign of the latest cumulative P&L. Green if
-  // we end positive overall, red if negative. Matches the hero Realised
-  // P&L card's color so the page tells one coherent story.
-  const final = points[points.length - 1].cumulative_pnl
+
+  // Color the realised P&L series by its final sign. Matches the hero card.
+  const final = chartData[chartData.length - 1].cumulative_pnl
   const isProfit = final >= 0
   const color = isProfit ? '#10b981' : '#f43f5e'
 
+  const hasSpy = (spyBenchmark ?? []).length > 0
+  const finalSpy = hasSpy
+    ? spyBenchmark[spyBenchmark.length - 1].cumulative_spy_pnl
+    : null
+  // Alpha — did active trading beat same-notional buy-and-hold SPY over
+  // the same windows? Positive = beating the index; negative = index
+  // would have served better.
+  const alpha = hasSpy && finalSpy !== null ? final - finalSpy : null
+
   return (
     <div>
-      <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
-        Cumulative realised P&amp;L
-      </h2>
-      <div className="rounded-lg border border-gray-800 bg-gray-900 p-4 h-[280px]">
+      <div className="flex items-baseline justify-between mb-3">
+        <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
+          Cumulative realised P&amp;L
+        </h2>
+        {alpha !== null && (
+          <span className="text-xs text-gray-500">
+            <span className="font-medium text-gray-400">Alpha vs SPY: </span>
+            <span
+              className={`font-mono font-semibold ${
+                alpha > 0.5
+                  ? 'text-emerald-400'
+                  : alpha < -0.5
+                    ? 'text-rose-400'
+                    : 'text-gray-300'
+              }`}
+            >
+              {alpha >= 0 ? '+' : ''}${alpha.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+            </span>
+          </span>
+        )}
+      </div>
+      <div className="rounded-lg border border-gray-800 bg-gray-900 p-4 h-[300px]">
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={points} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+          <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
             <defs>
               <linearGradient id="pnlFill" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor={color} stopOpacity={0.3} />
@@ -142,33 +189,74 @@ function EquityCurveChart({ points }) {
                 fontSize: '12px',
               }}
               labelFormatter={(iso) => new Date(iso).toLocaleString()}
-              formatter={(_value, name, props) => {
+              formatter={(value, name, props) => {
+                // Recharts calls the formatter once per series per point.
+                // Distinct labels per series so the tooltip shows both
+                // lines with clear attribution.
                 const p = props.payload
                 if (!p) return ['—', name]
-                // Two tooltip lines: cumulative + that trade's contribution
-                return [
-                  `$${p.cumulative_pnl.toLocaleString()} (${
-                    p.trade_pnl >= 0 ? '+' : ''
-                  }$${p.trade_pnl.toLocaleString()} on ${p.ticker})`,
-                  'Cumulative P&L',
-                ]
+                if (name === 'Realised P&L') {
+                  return [
+                    `$${p.cumulative_pnl.toLocaleString()} (${
+                      p.trade_pnl >= 0 ? '+' : ''
+                    }$${p.trade_pnl.toLocaleString()} on ${p.ticker})`,
+                    'Realised P&L',
+                  ]
+                }
+                if (name === 'SPY (same capital)') {
+                  if (p.cumulative_spy_pnl === null || p.cumulative_spy_pnl === undefined) {
+                    return ['—', name]
+                  }
+                  return [
+                    `$${p.cumulative_spy_pnl.toLocaleString()}`,
+                    'SPY (same capital)',
+                  ]
+                }
+                return [value, name]
               }}
               labelStyle={{ color: '#9ca3af' }}
             />
+            {hasSpy && (
+              <Legend
+                verticalAlign="top"
+                height={24}
+                wrapperStyle={{ fontSize: '11px', color: '#9ca3af' }}
+                iconSize={10}
+              />
+            )}
             <ReferenceLine y={0} stroke="#374151" strokeDasharray="3 3" />
             <Area
+              name="Realised P&L"
               type="monotone"
               dataKey="cumulative_pnl"
               stroke={color}
               strokeWidth={2}
               fill="url(#pnlFill)"
             />
+            {hasSpy && (
+              <Line
+                name="SPY (same capital)"
+                type="monotone"
+                dataKey="cumulative_spy_pnl"
+                stroke="#9ca3af"
+                strokeWidth={1.5}
+                strokeDasharray="4 4"
+                dot={false}
+                connectNulls
+              />
+            )}
           </AreaChart>
         </ResponsiveContainer>
       </div>
       <p className="text-xs text-gray-500 mt-2">
         Each point is a closed live trade. Line steps when P&amp;L realises —
         open positions don't move it until they close.
+        {hasSpy && (
+          <>
+            {' '}The dashed grey line is what the same dollar notional would
+            have earned held in SPY from each trade's open to close.
+          </>
+        )}
       </p>
     </div>
   )
