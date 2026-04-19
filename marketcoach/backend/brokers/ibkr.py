@@ -482,12 +482,17 @@ class IBKRBroker(BrokerClient):
         """
         if side != "buy":
             raise ValueError("Bracket orders only support BUY (long entries) in v1")
-        if target_qty is not None and target_qty < qty:
-            raise NotImplementedError(
-                "Scale-out bracket construction for IBKR is not wired up in "
-                "this commit — follows in the next one. Use target_qty=None "
-                "or target_qty=qty for a classic all-out bracket."
-            )
+        is_scale_out = target_qty is not None and target_qty < qty
+        if is_scale_out:
+            if target_qty != int(target_qty) or qty != int(qty):
+                raise ValueError(
+                    "Scale-out brackets require integer qty and target_qty"
+                )
+            if target_qty < 1 or qty - target_qty < 1:
+                raise ValueError(
+                    "Scale-out requires at least 1 share on both the T1 leg "
+                    "and the runner leg (so qty >= 2 and 1 <= target_qty < qty)"
+                )
         if paper_only and not self.paper:
             raise ValueError(
                 "Caller requested paper-only but broker is in live mode. "
@@ -506,19 +511,88 @@ class IBKRBroker(BrokerClient):
         async def _do():
             contract = _Stock(ticker, "SMART", "USD")
             await self._ib.qualifyContractsAsync(contract)
-            # ib_insync's bracketOrder helper wires the parentId + tif=GTC
-            # for us. It returns [parent, takeProfit, stopLoss] — submit all
-            # three to establish the OCO group at the broker.
-            bracket = self._ib.bracketOrder(
+
+            if not is_scale_out:
+                # Classic all-out bracket: ib_insync's helper wires parentId
+                # + tif=GTC for us. Returns [parent, takeProfit, stopLoss].
+                bracket = self._ib.bracketOrder(
+                    action="BUY",
+                    quantity=qty,
+                    limitPrice=limit_price,
+                    takeProfitPrice=take_profit_price,
+                    stopLossPrice=stop_loss_price,
+                )
+                trades = [self._ib.placeOrder(contract, o) for o in bracket]
+                await asyncio.sleep(2.0)
+                return trades
+
+            # Scale-out bracket. The helper doesn't support this shape, so
+            # we build four orders by hand:
+            #
+            #   parent BUY N        — entry (limit, tif=GTC, transmit=False)
+            #   TP SELL target_qty  — take-profit on the T1 portion
+            #                         (OCA group A, cancels SL_A on fill)
+            #   SL_A SELL target_qty— stop on the T1 portion
+            #                         (OCA group A, cancels TP on fill)
+            #   SL_B SELL remainder — runner's stop, no OCA group
+            #                         (becomes the breakeven-move target)
+            #
+            # When TP fills, OCA cancels SL_A. Runner shares are still
+            # covered by SL_B at the same initial stop. The state-machine
+            # in the position poll (commit 3) detects the TP fill via the
+            # existing Position delta logic and modifies SL_B.lmtPrice /
+            # auxPrice to the entry price → breakeven stop active.
+            runner_qty = qty - target_qty
+            # Prevents stop+target from colliding with any existing order
+            # group on the account. Keep unique per-ticker-per-session.
+            import time as _time
+            oca_group = f"mc_scaleout_{ticker}_{int(_time.time())}"
+
+            parent = _LimitOrder(
                 action="BUY",
-                quantity=qty,
-                limitPrice=limit_price,
-                takeProfitPrice=take_profit_price,
-                stopLossPrice=stop_loss_price,
+                totalQuantity=qty,
+                lmtPrice=limit_price,
+                tif="GTC",
+                transmit=False,  # children need parentId first
             )
-            trades = [self._ib.placeOrder(contract, o) for o in bracket]
+            parent_trade = self._ib.placeOrder(contract, parent)
+            parent_id = parent.orderId  # ib_insync assigns after placeOrder
+
+            tp_a = _LimitOrder(
+                action="SELL",
+                totalQuantity=target_qty,
+                lmtPrice=take_profit_price,
+                parentId=parent_id,
+                ocaGroup=oca_group,
+                ocaType=1,  # cancel-all-remaining-with-block
+                tif="GTC",
+                transmit=False,
+            )
+            sl_a = _StopOrder(
+                action="SELL",
+                totalQuantity=target_qty,
+                stopPrice=stop_loss_price,
+                parentId=parent_id,
+                ocaGroup=oca_group,
+                ocaType=1,
+                tif="GTC",
+                transmit=False,
+            )
+            sl_b = _StopOrder(
+                action="SELL",
+                totalQuantity=runner_qty,
+                stopPrice=stop_loss_price,
+                parentId=parent_id,
+                tif="GTC",
+                transmit=True,  # last order triggers group submission
+            )
+
+            self._ib.placeOrder(contract, tp_a)
+            self._ib.placeOrder(contract, sl_a)
+            self._ib.placeOrder(contract, sl_b)
+
             await asyncio.sleep(2.0)
-            return trades
+            return [parent_trade]
 
         try:
             trades = _run_on_broker_loop(_do(), timeout=15.0)
@@ -531,11 +605,15 @@ class IBKRBroker(BrokerClient):
                 else None
             )
 
+            scale_tag = (
+                f" [SCALE-OUT: T1={target_qty}, runner={qty - target_qty}]"
+                if is_scale_out else ""
+            )
             logger.info(
                 "IBKR bracket submitted: BUY %s x%.2f @ $%.2f "
-                "(stop $%.2f, target $%.2f) → %s (paper=%s, fill=%s)",
+                "(stop $%.2f, target $%.2f)%s → %s (paper=%s, fill=%s)",
                 ticker, qty, limit_price, stop_loss_price, take_profit_price,
-                status, self.paper, avg_fill,
+                scale_tag, status, self.paper, avg_fill,
             )
 
             return OrderResult(

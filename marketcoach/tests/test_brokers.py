@@ -431,16 +431,96 @@ class TestScaleOutBracketSignature:
         )
         assert result.status == "error_disconnected"
 
-    def test_ibkr_raises_notimplemented_on_scale_out(self):
+    def test_ibkr_scale_out_places_four_orders(self):
+        """
+        Scale-out bracket is constructed as 4 orders: parent + OCA'd (TP +
+        SL_A on the T1 portion) + independent SL_B on the runner. All
+        placeOrder calls happen on the broker loop; the test mocks the
+        IB client so we verify order shapes without hitting TWS.
+        """
+        from unittest.mock import AsyncMock
+
         b = IBKRBroker(paper=True)
-        with pytest.raises(NotImplementedError, match="[Ss]cale-out"):
-            b.place_bracket_order(
+
+        fake_order = SimpleNamespace(permId=888, orderId=42)
+        fake_status = SimpleNamespace(status="Submitted", avgFillPrice=None)
+        fake_parent_trade = SimpleNamespace(
+            order=fake_order, orderStatus=fake_status, log=[],
+        )
+
+        fake_ib = MagicMock()
+        fake_ib.isConnected.return_value = True
+        fake_ib.qualifyContractsAsync = AsyncMock(return_value=[])
+        fake_ib.placeOrder = MagicMock(return_value=fake_parent_trade)
+        b._ib = fake_ib
+
+        # We need the parent Order to expose an orderId attribute that
+        # ib_insync normally assigns on placeOrder. _LimitOrder is a real
+        # class with attribute access, so we just let the ctor create one
+        # and rely on its default orderId=0 (unique enough for a mocked test).
+        with patch("backend.brokers.ibkr._Stock", return_value=SimpleNamespace(symbol="SPY")):
+            result = b.place_bracket_order(
                 ticker="SPY",
-                qty=2,
+                qty=4,
                 side="buy",
                 limit_price=540.0,
                 stop_loss_price=534.0,
                 take_profit_price=552.0,
                 paper_only=True,
                 target_qty=1,
+            )
+
+        assert isinstance(result, OrderResult)
+        # Parent + TP + SL_A + SL_B = 4 placeOrder calls
+        assert fake_ib.placeOrder.call_count == 4
+
+        # Extract the Order object from each placeOrder call
+        placed_orders = [call.args[1] for call in fake_ib.placeOrder.call_args_list]
+        actions = [o.action for o in placed_orders]
+        quantities = [o.totalQuantity for o in placed_orders]
+
+        assert actions == ["BUY", "SELL", "SELL", "SELL"]
+        # Parent buys 4, TP sells 1, SL_A sells 1, SL_B sells 3 (runner)
+        assert quantities == [4, 1, 1, 3]
+
+        # TP + SL_A share an OCA group so one cancels the other on fill.
+        # SL_B has no OCA so it survives independently.
+        tp_a = placed_orders[1]
+        sl_a = placed_orders[2]
+        sl_b = placed_orders[3]
+        assert tp_a.ocaGroup and sl_a.ocaGroup and tp_a.ocaGroup == sl_a.ocaGroup
+        assert not getattr(sl_b, "ocaGroup", None)
+
+        # Only the last order has transmit=True so TWS submits the whole
+        # group atomically. The first three must be transmit=False.
+        transmits = [getattr(o, "transmit", True) for o in placed_orders]
+        assert transmits == [False, False, False, True]
+
+    def test_ibkr_scale_out_rejects_fractional_qty(self):
+        b = IBKRBroker(paper=True)
+        with pytest.raises(ValueError, match="integer"):
+            b.place_bracket_order(
+                ticker="SPY",
+                qty=2.5,
+                side="buy",
+                limit_price=540.0,
+                stop_loss_price=534.0,
+                take_profit_price=552.0,
+                paper_only=True,
+                target_qty=1,
+            )
+
+    def test_ibkr_scale_out_rejects_qty_too_small(self):
+        """qty=2, target_qty=1 is the minimum valid scale-out. qty=1 can't split."""
+        b = IBKRBroker(paper=True)
+        with pytest.raises(ValueError, match="at least 1 share"):
+            b.place_bracket_order(
+                ticker="SPY",
+                qty=1,
+                side="buy",
+                limit_price=540.0,
+                stop_loss_price=534.0,
+                take_profit_price=552.0,
+                paper_only=True,
+                target_qty=0,
             )
