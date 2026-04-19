@@ -17,6 +17,9 @@ from typing import Any, Optional
 import anthropic
 from sqlalchemy.orm import Session
 
+import re
+from datetime import datetime, timezone
+
 from backend.agents.analysis_agent import AnalysisAgent
 from backend.agents.coach_agent import CoachAgent
 from backend.agents.memory_agent import MemoryAgent
@@ -27,6 +30,106 @@ from backend.agents.base import AgentResult
 from backend.config import settings
 from backend.db import crud
 from backend.brokers import get_broker
+
+
+# ── Material-change gate (state-aware advisor calls) ──────────────────────────
+#
+# Swing trading doesn't need fresh analysis every 4 hours — it needs fresh
+# analysis when the situation materially changes. These thresholds are tuned
+# for 2–20 day holds. Day-trader tuning would be tighter.
+
+MATERIAL_PRICE_CHANGE_PCT = 3.0   # % move that warrants re-analysis
+MATERIAL_TIME_ELAPSED_HOURS = 48  # force a re-run after this long, regardless
+
+
+def _should_skip_advisor(
+    cached,
+    current_price: float,
+    now: datetime,
+) -> tuple[bool, str]:
+    """
+    Decide whether a news reaction should skip the advisor call because
+    the prior analysis is still fresh enough to trust.
+
+    Returns (should_skip, reason). reason is a short human-readable string
+    recorded on the lightweight news_reactions row so the UI shows why.
+
+    Rules:
+      - No cache entry → do not skip (first analysis for this ticker)
+      - Price moved ≥ MATERIAL_PRICE_CHANGE_PCT since last run → do not skip
+      - More than MATERIAL_TIME_ELAPSED_HOURS since last run → do not skip
+      - Otherwise → skip (prior analysis still valid)
+    """
+    if cached is None:
+        return False, "no-prior-analysis"
+
+    last_run_at = cached.last_run_at
+    if last_run_at.tzinfo is None:
+        last_run_at = last_run_at.replace(tzinfo=timezone.utc)
+    hours_elapsed = (now - last_run_at).total_seconds() / 3600.0
+
+    if hours_elapsed >= MATERIAL_TIME_ELAPSED_HOURS:
+        return False, f"stale ({hours_elapsed:.1f}h elapsed)"
+
+    if cached.last_price and cached.last_price > 0:
+        price_change_pct = abs(current_price - cached.last_price) / cached.last_price * 100.0
+        if price_change_pct >= MATERIAL_PRICE_CHANGE_PCT:
+            return False, f"price moved {price_change_pct:.1f}%"
+    else:
+        # No usable prior price — better to re-analyze than trust a bad cache
+        return False, "no-prior-price"
+
+    # Nothing material changed — skip
+    return True, (
+        f"cached analysis still fresh "
+        f"({hours_elapsed:.1f}h ago, "
+        f"price Δ<{MATERIAL_PRICE_CHANGE_PCT}%, "
+        f"prior={cached.last_recommendation or 'unknown'})"
+    )
+
+
+def _extract_recommendation(content: str) -> str:
+    """
+    Heuristic extraction of the advisor's recommendation from its free-form
+    reply. Scans for common keywords and falls back to 'unknown' if the
+    advisor hedged or didn't produce a clear call.
+
+    Keeping this as a keyword match rather than asking Claude to emit a
+    structured field — that would mean another round-trip and defeats the
+    whole purpose of the caching gate.
+    """
+    if not content:
+        return "unknown"
+
+    text = content.lower()
+    # Order matters: avoid > sell > buy > hold (more decisive first)
+    patterns = [
+        ("avoid", r"\b(avoid|do not (buy|enter)|stay away|pass on)\b"),
+        ("sell", r"\b(sell|exit|trim|close|take profits?|get out)\b"),
+        ("buy", r"\b(buy|enter|add|accumulate|scale in|go long)\b"),
+        ("hold", r"\b(hold|maintain|sit tight|no action|stand pat)\b"),
+    ]
+    for label, pattern in patterns:
+        if re.search(pattern, text):
+            return label
+    return "unknown"
+
+
+def _fetch_current_price(ticker: str) -> Optional[float]:
+    """
+    Cheap yfinance quote used by the material-change gate. Returns None
+    if the fetch fails — caller treats None as "can't decide, re-run
+    advisor" rather than skipping on stale data.
+    """
+    try:
+        import yfinance as yf
+        t = yf.Ticker(ticker)
+        hist = t.history(period="1d")
+        if hist.empty:
+            return None
+        return float(hist["Close"].iloc[-1])
+    except Exception:
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -229,8 +332,47 @@ class Orchestrator:
         candidates = candidates[: settings.news_reactions_per_run_max]
 
         created = 0
+        now = datetime.now(timezone.utc)
         for sig, ticker, reason in candidates:
             headline = sig.get("headline", "")
+
+            # Material-change gate: skip the advisor call if we analyzed
+            # this ticker recently and nothing material has moved. Saves
+            # the token spend + avoids redundant "still hold" conclusions.
+            cached = crud.get_advisor_cache(self.db, ticker)
+            current_price = _fetch_current_price(ticker)
+            if current_price is not None:
+                skip, skip_reason = _should_skip_advisor(cached, current_price, now)
+            else:
+                # yfinance failed — can't judge material change, err on the
+                # side of re-running to avoid acting on stale data.
+                skip, skip_reason = False, "price-unavailable"
+
+            if skip:
+                logger.info(
+                    "News reaction suppressed for %s (%s): %s",
+                    ticker, reason, skip_reason,
+                )
+                prior_note = (
+                    f"Signal suppressed by material-change gate.\n\n"
+                    f"**Reason:** {skip_reason}\n\n"
+                    f"**Prior recommendation:** {cached.last_recommendation or 'unknown'} "
+                    f"at ${cached.last_price:.2f} "
+                    f"on {cached.last_run_at:%Y-%m-%d %H:%M UTC}\n\n"
+                    f"**Current price:** ${current_price:.2f}\n\n"
+                    f"*No advisor call made. To re-analyze, trigger manually from the UI.*"
+                )
+                crud.create_news_reaction(
+                    self.db,
+                    ticker=ticker,
+                    headline=headline,
+                    content=prior_note,
+                    trigger_reason="cached_analysis",
+                    status="read",  # no email, no notification
+                )
+                created += 1
+                continue
+
             reaction_prompt = (
                 f"React to this news on {ticker}: {headline}\n\n"
                 "Assess impact on any open positions and call out new "
@@ -259,6 +401,26 @@ class Orchestrator:
                 created += 1
 
                 if advisor_result.success and content:
+                    # Update the cache so the next signal on this ticker
+                    # can check against fresh state. Only upsert on success
+                    # to avoid poisoning the cache with failed reactions.
+                    if current_price is not None:
+                        try:
+                            crud.upsert_advisor_cache(
+                                self.db,
+                                ticker=ticker,
+                                price=current_price,
+                                recommendation=_extract_recommendation(content),
+                                rationale_summary=content[:500],
+                                advisor_session_id=settings.news_reaction_session_id,
+                            )
+                        except Exception as exc:
+                            # Cache miss is non-fatal — logs and continues
+                            logger.warning(
+                                "Advisor cache upsert failed for %s: %s",
+                                ticker, exc,
+                            )
+
                     from backend.notifications import notify
                     notify(
                         f"News Alert: {ticker} — {headline[:80]}",
@@ -945,10 +1107,33 @@ class Orchestrator:
         manual "run now" button in the UI. The generated plan is stored in the
         weekly_plans table so the frontend can display the latest one without
         re-invoking Claude.
+
+        When intelligence_pipeline_enabled is False (swing-trader mode), the
+        news + analysis + trade-idea pipeline runs once inside this method
+        before generating the plan. This folds the pipeline's weekly cadence
+        into the weekly plan itself rather than burning tokens on a schedule
+        that doesn't match a swing trader's actual decision cadence.
         """
         from backend.config import settings as _settings
 
         session_id = _settings.weekly_plan_session_id
+
+        # Fold the intelligence pipeline into the weekly plan when it's
+        # disabled as a standalone scheduled job. Non-fatal on failure —
+        # the plan can still run against whatever signals already exist
+        # in the DB, just without fresh ones for this week.
+        if not _settings.intelligence_pipeline_enabled:
+            try:
+                logger.info(
+                    "Weekly plan: running folded intelligence pipeline first "
+                    "(intelligence_pipeline_enabled=False)"
+                )
+                self.run_intelligence_pipeline()
+            except Exception as exc:
+                logger.warning(
+                    "Folded intelligence pipeline failed, continuing with "
+                    "existing signals: %s", exc,
+                )
 
         theses = crud.get_open_theses(self.db, limit=10)
         signals = crud.get_recent_signals(self.db, hours=168)  # last 7 days

@@ -199,14 +199,15 @@ def _run_position_check() -> None:
 def start_scheduler() -> None:
     cron_tz = _cron_timezone()
 
-    scheduler.add_job(
-        _run_intelligence_pipeline,
-        trigger=IntervalTrigger(hours=settings.agent_run_interval_hours),
-        id="intelligence_pipeline",
-        name="News + Analysis Pipeline",
-        replace_existing=True,
-        misfire_grace_time=300,  # 5 min grace period if a run is late
-    )
+    if settings.intelligence_pipeline_enabled:
+        scheduler.add_job(
+            _run_intelligence_pipeline,
+            trigger=IntervalTrigger(hours=settings.agent_run_interval_hours),
+            id="intelligence_pipeline",
+            name="News + Analysis Pipeline",
+            replace_existing=True,
+            misfire_grace_time=300,  # 5 min grace period if a run is late
+        )
 
     if settings.weekly_plan_enabled:
         scheduler.add_job(
@@ -258,9 +259,13 @@ def start_scheduler() -> None:
 
     scheduler.start()
     logger.info(
-        "Scheduler started — tz=%s, intelligence=%dh, weekly=%s, morning=%s, position_poll=%s",
+        "Scheduler started — tz=%s, intelligence=%s, weekly=%s, morning=%s, position_poll=%s",
         str(cron_tz) if cron_tz else "server-local",
-        settings.agent_run_interval_hours,
+        (
+            f"{settings.agent_run_interval_hours}h"
+            if settings.intelligence_pipeline_enabled
+            else "folded-into-weekly"
+        ),
         (
             f"{settings.weekly_plan_day_of_week} "
             f"{settings.weekly_plan_hour:02d}:{settings.weekly_plan_minute:02d}"

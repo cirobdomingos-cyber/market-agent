@@ -379,3 +379,311 @@ class TestReactionApi:
         rs = crud.list_news_reactions(db)
         client.post(f"/news-reactions/{rs[0].id}/read")
         assert client.get("/news-reactions/unread-count").json() == {"unread": 1}
+
+
+# ── 4. State-aware advisor gate (material-change rule) ──────────────────────
+
+class TestMaterialChangeHelpers:
+    """
+    Unit tests for the module-level helpers that decide whether a news
+    reaction should skip the advisor call. Pure functions, no DB or API —
+    just logic that must be right because it gates real token spend.
+    """
+
+    def test_should_skip_no_cache_runs_advisor(self):
+        from backend.agents.orchestrator import _should_skip_advisor
+        from datetime import datetime, timezone
+        now = datetime(2026, 4, 18, 12, 0, tzinfo=timezone.utc)
+        skip, reason = _should_skip_advisor(None, 100.0, now)
+        assert skip is False
+        assert "no-prior" in reason
+
+    def test_should_skip_within_thresholds(self):
+        from backend.agents.orchestrator import _should_skip_advisor
+        from datetime import datetime, timezone, timedelta
+        from backend.db.models import AdvisorActionCache
+        now = datetime(2026, 4, 18, 12, 0, tzinfo=timezone.utc)
+        cached = AdvisorActionCache(
+            ticker="NVDA",
+            last_run_at=now - timedelta(hours=2),
+            last_price=450.0,
+            last_recommendation="hold",
+        )
+        # Price moved 1.1%, 2h elapsed — both under thresholds
+        skip, reason = _should_skip_advisor(cached, 455.0, now)
+        assert skip is True
+        assert "fresh" in reason
+        assert "hold" in reason  # prior recommendation surfaced
+
+    def test_should_not_skip_when_price_moves_3pct(self):
+        from backend.agents.orchestrator import _should_skip_advisor
+        from datetime import datetime, timezone, timedelta
+        from backend.db.models import AdvisorActionCache
+        now = datetime(2026, 4, 18, 12, 0, tzinfo=timezone.utc)
+        cached = AdvisorActionCache(
+            ticker="NVDA",
+            last_run_at=now - timedelta(hours=2),
+            last_price=450.0,
+            last_recommendation="hold",
+        )
+        # Moved ~3.3% down — crosses the threshold
+        skip, reason = _should_skip_advisor(cached, 435.0, now)
+        assert skip is False
+        assert "price moved" in reason
+
+    def test_should_not_skip_after_48h(self):
+        from backend.agents.orchestrator import _should_skip_advisor
+        from datetime import datetime, timezone, timedelta
+        from backend.db.models import AdvisorActionCache
+        now = datetime(2026, 4, 18, 12, 0, tzinfo=timezone.utc)
+        cached = AdvisorActionCache(
+            ticker="NVDA",
+            last_run_at=now - timedelta(hours=49),
+            last_price=450.0,
+            last_recommendation="hold",
+        )
+        # Price stable but time threshold crossed
+        skip, reason = _should_skip_advisor(cached, 451.0, now)
+        assert skip is False
+        assert "stale" in reason
+
+    def test_should_not_skip_when_cached_price_missing(self):
+        from backend.agents.orchestrator import _should_skip_advisor
+        from datetime import datetime, timezone, timedelta
+        from backend.db.models import AdvisorActionCache
+        now = datetime(2026, 4, 18, 12, 0, tzinfo=timezone.utc)
+        cached = AdvisorActionCache(
+            ticker="NVDA",
+            last_run_at=now - timedelta(hours=2),
+            last_price=0.0,  # pathological
+        )
+        skip, reason = _should_skip_advisor(cached, 100.0, now)
+        assert skip is False
+        assert "no-prior-price" in reason
+
+
+class TestExtractRecommendation:
+    """
+    Heuristic extraction from free-form advisor text. Keyword-based — not
+    perfect, but good enough for cache rollups that don't need to be exact.
+    """
+
+    def test_buy_detected(self):
+        from backend.agents.orchestrator import _extract_recommendation
+        assert _extract_recommendation("I would buy here aggressively.") == "buy"
+        assert _extract_recommendation("Enter on any dip below $450.") == "buy"
+
+    def test_sell_detected(self):
+        from backend.agents.orchestrator import _extract_recommendation
+        assert _extract_recommendation("Time to trim this position.") == "sell"
+        assert _extract_recommendation("Take profits now.") == "sell"
+
+    def test_hold_detected(self):
+        from backend.agents.orchestrator import _extract_recommendation
+        assert _extract_recommendation("Hold for now, thesis intact.") == "hold"
+
+    def test_avoid_detected(self):
+        from backend.agents.orchestrator import _extract_recommendation
+        assert _extract_recommendation("Avoid this setup entirely.") == "avoid"
+        assert _extract_recommendation("Do not buy here.") == "avoid"
+
+    def test_unknown_on_hedged_content(self):
+        from backend.agents.orchestrator import _extract_recommendation
+        # No decisive keyword — should fall through to unknown
+        assert _extract_recommendation("The situation is developing.") == "unknown"
+        assert _extract_recommendation("") == "unknown"
+
+    def test_more_decisive_keyword_wins(self):
+        """
+        When both 'avoid' and 'hold' appear, 'avoid' wins — more decisive.
+        Matches the priority order in the implementation.
+        """
+        from backend.agents.orchestrator import _extract_recommendation
+        assert _extract_recommendation("Avoid for now, but hold existing positions") == "avoid"
+
+
+class TestReactionGateIntegration:
+    """
+    End-to-end test that the material-change gate actually suppresses
+    advisor calls in _trigger_news_reactions and creates the lightweight
+    placeholder row instead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _seed_watchlist(self, db):
+        from backend.db.models import WatchlistTicker
+        db.add(WatchlistTicker(ticker="NVDA"))
+        db.commit()
+
+    def test_cached_signal_skips_advisor_and_creates_placeholder(self, db):
+        from datetime import datetime, timezone, timedelta
+        # Prime the cache with a fresh "hold" at $450
+        crud.upsert_advisor_cache(
+            db,
+            ticker="NVDA",
+            price=450.0,
+            recommendation="hold",
+            rationale_summary="Holding through the range.",
+        )
+
+        orch = _make_orchestrator(db)
+        orch.run_advisor = MagicMock()  # should NOT be called
+
+        with patch("backend.agents.orchestrator._fetch_current_price", return_value=453.0), \
+             patch("backend.agents.orchestrator.get_broker", return_value=None):
+            n = orch._trigger_news_reactions([{
+                "ticker": "NVDA",
+                "confidence": 0.9,
+                "sentiment": "bullish",
+                "headline": "NVDA breakout above resistance",
+            }])
+
+        assert n == 1
+        orch.run_advisor.assert_not_called()
+
+        reactions = crud.list_news_reactions(db)
+        assert len(reactions) == 1
+        assert reactions[0].trigger_reason == "cached_analysis"
+        assert reactions[0].status == "read"  # no email, silent in UI
+        assert "suppressed" in reactions[0].content.lower()
+        assert "hold" in reactions[0].content.lower()
+
+    def test_material_price_change_reruns_advisor(self, db):
+        from datetime import datetime, timezone, timedelta
+        crud.upsert_advisor_cache(
+            db,
+            ticker="NVDA",
+            price=450.0,
+            recommendation="hold",
+        )
+
+        orch = _make_orchestrator(db)
+        orch.run_advisor = MagicMock(
+            return_value=AgentResult(success=True, data={"reply": "Buy this aggressively"})
+        )
+
+        # 4% down from $450 = ~$432, well past the 3% threshold
+        with patch("backend.agents.orchestrator._fetch_current_price", return_value=432.0), \
+             patch("backend.agents.orchestrator.get_broker", return_value=None):
+            n = orch._trigger_news_reactions([{
+                "ticker": "NVDA",
+                "confidence": 0.9,
+                "sentiment": "bullish",
+                "headline": "NVDA 4% drop",
+            }])
+
+        assert n == 1
+        orch.run_advisor.assert_called_once()
+
+        reactions = crud.list_news_reactions(db)
+        assert reactions[0].trigger_reason == "watchlist"
+        assert reactions[0].status == "unread"
+
+        # Cache should have been updated with the new run
+        cache = crud.get_advisor_cache(db, "NVDA")
+        assert cache.last_price == 432.0
+        assert cache.last_recommendation == "buy"
+
+    def test_no_cache_runs_advisor_normally(self, db):
+        """First-ever signal on a ticker — cache is empty, must run the advisor."""
+        orch = _make_orchestrator(db)
+        orch.run_advisor = MagicMock(
+            return_value=AgentResult(success=True, data={"reply": "Hold for now"})
+        )
+
+        with patch("backend.agents.orchestrator._fetch_current_price", return_value=450.0), \
+             patch("backend.agents.orchestrator.get_broker", return_value=None):
+            orch._trigger_news_reactions([{
+                "ticker": "NVDA",
+                "confidence": 0.9,
+                "sentiment": "bullish",
+                "headline": "First signal",
+            }])
+
+        orch.run_advisor.assert_called_once()
+        cache = crud.get_advisor_cache(db, "NVDA")
+        assert cache is not None
+        assert cache.last_recommendation == "hold"
+
+    def test_price_fetch_failure_runs_advisor(self, db):
+        """
+        yfinance unavailable — can't judge material change, so run the
+        advisor rather than skip on stale cache data. Erring on the side
+        of accuracy over cost.
+        """
+        crud.upsert_advisor_cache(db, ticker="NVDA", price=450.0, recommendation="hold")
+        orch = _make_orchestrator(db)
+        orch.run_advisor = MagicMock(
+            return_value=AgentResult(success=True, data={"reply": "Hold for now"})
+        )
+
+        with patch("backend.agents.orchestrator._fetch_current_price", return_value=None), \
+             patch("backend.agents.orchestrator.get_broker", return_value=None):
+            orch._trigger_news_reactions([{
+                "ticker": "NVDA",
+                "confidence": 0.9,
+                "sentiment": "bullish",
+                "headline": "Signal",
+            }])
+
+        orch.run_advisor.assert_called_once()
+
+
+# ── 5. Intelligence pipeline folding (swing-trader mode) ────────────────────
+
+class TestWeeklyPlanIntelligenceFolding:
+    """
+    When intelligence_pipeline_enabled=False, run_weekly_plan must call
+    run_intelligence_pipeline() before generating the plan so signals stay
+    fresh. When the flag is True (day-trader default), the pipeline runs
+    on its own cadence and the weekly plan uses existing signals.
+    """
+
+    def test_folding_runs_pipeline_when_flag_disabled(self, db):
+        orch = _make_orchestrator(db)
+        orch.run_intelligence_pipeline = MagicMock(return_value={})
+        orch.run_advisor = MagicMock(
+            return_value=AgentResult(success=True, data={"reply": "Weekly plan body"})
+        )
+
+        with patch.object(settings, "intelligence_pipeline_enabled", False):
+            result = orch.run_weekly_plan(trigger="test")
+
+        orch.run_intelligence_pipeline.assert_called_once()
+        orch.run_advisor.assert_called_once()
+        assert result.success is True
+
+    def test_folding_skipped_when_flag_enabled(self, db):
+        orch = _make_orchestrator(db)
+        orch.run_intelligence_pipeline = MagicMock(return_value={})
+        orch.run_advisor = MagicMock(
+            return_value=AgentResult(success=True, data={"reply": "Weekly plan body"})
+        )
+
+        with patch.object(settings, "intelligence_pipeline_enabled", True):
+            orch.run_weekly_plan(trigger="test")
+
+        # Pipeline should NOT run inside weekly plan when the standalone
+        # scheduled job is enabled — that would double-fire it
+        orch.run_intelligence_pipeline.assert_not_called()
+        orch.run_advisor.assert_called_once()
+
+    def test_weekly_plan_continues_on_folded_pipeline_failure(self, db):
+        """
+        Folded pipeline failure must not block the weekly plan — log the
+        warning and press on with whatever signals already exist in the DB.
+        """
+        orch = _make_orchestrator(db)
+        orch.run_intelligence_pipeline = MagicMock(
+            side_effect=Exception("yfinance rate limited")
+        )
+        orch.run_advisor = MagicMock(
+            return_value=AgentResult(success=True, data={"reply": "Plan despite failure"})
+        )
+
+        with patch.object(settings, "intelligence_pipeline_enabled", False):
+            result = orch.run_weekly_plan(trigger="test")
+
+        orch.run_intelligence_pipeline.assert_called_once()
+        orch.run_advisor.assert_called_once()
+        assert result.success is True

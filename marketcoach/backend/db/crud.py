@@ -10,6 +10,7 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from backend.db.models import (
+    AdvisorActionCache,
     AutoRule,
     BacktestRun,
     ChatMessage,
@@ -854,3 +855,54 @@ def list_morning_briefs(db: Session, limit: int = 14) -> list[MorningBrief]:
         .limit(limit)
         .all()
     )
+
+
+# -- AdvisorActionCache -------------------------------------------------------
+
+def get_advisor_cache(db: Session, ticker: str) -> Optional[AdvisorActionCache]:
+    """Return the cache entry for a ticker, or None if we've never analyzed it."""
+    return (
+        db.query(AdvisorActionCache)
+        .filter(AdvisorActionCache.ticker == ticker.upper())
+        .first()
+    )
+
+
+def upsert_advisor_cache(
+    db: Session,
+    ticker: str,
+    price: float,
+    recommendation: Optional[str] = None,
+    rationale_summary: Optional[str] = None,
+    advisor_session_id: Optional[str] = None,
+) -> AdvisorActionCache:
+    """
+    Insert or update the advisor-action cache row for a ticker. Always
+    bumps last_run_at to now. Called by the orchestrator AFTER a
+    successful advisor run so the next signal on the same ticker can
+    check against fresh state.
+    """
+    ticker = ticker.upper()
+    entry = get_advisor_cache(db, ticker)
+    if entry is None:
+        entry = AdvisorActionCache(
+            ticker=ticker,
+            last_run_at=datetime.now(timezone.utc),
+            last_price=price,
+            last_recommendation=recommendation,
+            last_rationale_summary=rationale_summary,
+            last_advisor_session_id=advisor_session_id,
+        )
+        db.add(entry)
+    else:
+        entry.last_run_at = datetime.now(timezone.utc)
+        entry.last_price = price
+        if recommendation is not None:
+            entry.last_recommendation = recommendation
+        if rationale_summary is not None:
+            entry.last_rationale_summary = rationale_summary
+        if advisor_session_id is not None:
+            entry.last_advisor_session_id = advisor_session_id
+    db.commit()
+    db.refresh(entry)
+    return entry

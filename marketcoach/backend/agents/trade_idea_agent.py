@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 import anthropic
 from sqlalchemy.orm import Session
 
-from backend.agents.base import MODEL, AgentResult, BaseAgent
+from backend.agents.base import AgentResult, BaseAgent
 from backend.db import crud
 from backend.tools.market_data import execute_market_data
 from backend.tools.risk import (

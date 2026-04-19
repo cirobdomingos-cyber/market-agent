@@ -172,3 +172,42 @@ class TestBrokerReadTool:
         result = execute_broker_read_tool("get_positions")
         assert "error" in result
         assert "not initialised" in result["error"].lower()
+
+
+class TestPerAgentModelOverride:
+    """
+    Regression guard: per-agent MODEL overrides must win over the module-level
+    default. The NewsAgent in particular is expected to run on Haiku (~10x
+    cheaper than Sonnet) because news extraction is a structured task where
+    the smaller model performs at parity. This test locks in that override
+    so a future refactor can't silently put NewsAgent back on Sonnet.
+    """
+
+    def test_base_agent_defaults_to_module_model(self):
+        from backend.agents.base import BaseAgent, MODEL
+
+        assert BaseAgent.MODEL == MODEL
+        assert BaseAgent.MODEL == "claude-sonnet-4-6"
+
+    def test_news_agent_overrides_to_haiku(self):
+        from backend.agents.news_agent import NewsAgent
+
+        assert NewsAgent.MODEL == "claude-haiku-4-5-20251001"
+
+    def test_reasoning_agents_stay_on_sonnet(self):
+        """
+        Reasoning-heavy agents (analysis, trade ideas, memory, coach,
+        advisor) should NOT accidentally inherit a Haiku override from
+        somewhere. They stay on the Sonnet default unless explicitly
+        overridden with a deliberate comment justifying the change.
+        """
+        from backend.agents.analysis_agent import AnalysisAgent
+        from backend.agents.trade_idea_agent import TradeIdeaAgent
+        from backend.agents.memory_agent import MemoryAgent
+        from backend.agents.coach_agent import CoachAgent
+        from backend.agents.trading_advisor_agent import TradingAdvisorAgent
+
+        for cls in [AnalysisAgent, TradeIdeaAgent, MemoryAgent, CoachAgent, TradingAdvisorAgent]:
+            assert cls.MODEL == "claude-sonnet-4-6", (
+                f"{cls.__name__} should use Sonnet — reasoning quality matters"
+            )
