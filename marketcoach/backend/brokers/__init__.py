@@ -2,22 +2,27 @@
 Broker abstraction layer.
 
 MarketCoach is broker-agnostic at the orchestration layer. This package
-defines a single `BrokerClient` ABC that each concrete broker (Alpaca,
-IBKR, future LocalBroker for paper-only simulation) implements identically.
+defines a single `BrokerClient` ABC that concrete brokers implement.
 
-Why an abstraction:
-  - Alpaca stopped accepting Brazilian residents for live accounts. Rather
-    than rewrite the whole stack, we needed a way to swap the broker without
-    touching the agents, the API endpoints, or the frontend.
-  - IBKR (Interactive Brokers) accepts Brazilian residents and has the only
-    serious API in international retail brokerage — but its client is much
-    clunkier than Alpaca's REST API. The abstraction hides those differences.
-  - A future virtual-portfolio broker can drop in here too if we ever want
-    a fully self-hosted simulation path.
+Currently supported providers:
+  - "ibkr" — Interactive Brokers via ib_insync + local IB Gateway. The
+    active broker for live trading (IBKR accepts Brazilian residents
+    where most US retail brokers don't).
+  - "none" — explicit opt-out. Used by cloud-hosted analysis services
+    that can't reach a local broker. Trading endpoints return 503;
+    analysis features are unaffected.
 
-Selection happens at startup via settings.broker_provider ("alpaca" | "ibkr").
-The factory `init_broker()` is called from main.py's lifespan; everything
-else in the codebase calls `get_broker()` to retrieve the singleton.
+Historical note: "alpaca" was the original default and was removed in
+the refactor/remove-alpaca branch. Alpaca stopped onboarding Brazilian
+residents for live trading, so the integration never exercised its
+live path for this project and became dead code after IBKR was wired
+up. The abstraction still makes sense — a future LocalBroker for pure
+simulation, or a second live broker on a different market, would drop
+in under this same interface.
+
+Selection happens at startup via settings.broker_provider. The factory
+`init_broker()` is called from main.py's lifespan; everything else in
+the codebase calls `get_broker()` to retrieve the singleton.
 """
 
 from backend.brokers.base import BrokerClient, OrderResult

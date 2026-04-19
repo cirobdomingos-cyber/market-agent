@@ -185,7 +185,7 @@ export default function Advisor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const alpacaConnected =
+  const brokerConnected =
     account && account.status !== 'disconnected' && !account.error
 
   return (
@@ -311,7 +311,7 @@ export default function Advisor() {
       <div className="w-full lg:w-72 space-y-4 text-sm">
         <div>
           <p className="font-semibold text-gray-300 mb-2">Account</p>
-          {alpacaConnected ? (
+          {brokerConnected ? (
             <div className="space-y-1 text-gray-400">
               <div className="flex justify-between">
                 <span>Portfolio value</span>
@@ -338,8 +338,8 @@ export default function Advisor() {
             </div>
           ) : (
             <div className="text-xs text-amber-400">
-              Alpaca not connected. Set ALPACA_API_KEY and ALPACA_SECRET_KEY to
-              enable live sizing.
+              Broker not connected. Start IB Gateway locally and set
+              BROKER_PROVIDER=ibkr in .env to enable live position sizing.
             </div>
           )}
         </div>

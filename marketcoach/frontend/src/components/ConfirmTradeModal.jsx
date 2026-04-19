@@ -119,7 +119,7 @@ export default function ConfirmTradeModal({
           <strong className={isLive ? 'text-red-400' : 'text-emerald-400'}>
             {isLive ? 'LIVE' : 'paper'}
           </strong>{' '}
-          Alpaca account.
+          broker account (IBKR).
         </p>
 
         <div className="space-y-2 text-sm bg-gray-950 rounded p-3 mb-4 border border-gray-800">
@@ -318,7 +318,7 @@ export default function ConfirmTradeModal({
             />
             <span>
               I understand this places a <strong>real-money order</strong> using my
-              live Alpaca account. I have verified the ticker, side, quantity, and
+              live broker account. I have verified the ticker, side, quantity, and
               price above.
             </span>
           </label>

@@ -4,26 +4,35 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # extra="ignore" lets us drop settings fields without requiring every
+    # deployed .env to be cleaned up in lockstep. When ALPACA_API_KEY was
+    # removed in refactor/remove-alpaca, leaving it in a developer's .env
+    # was harmless — the value just isn't read. Same shield against other
+    # future removals: staged-rollout-safe.
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     anthropic_api_key: str
 
     # ── Broker selection ─────────────────────────────────────────────────────
-    # Which broker MarketCoach talks to. "alpaca" by default (the original
-    # integration); "ibkr" for Interactive Brokers via ib_insync. Brazilian
-    # residents need IBKR because Alpaca won't onboard them for live accounts.
+    # Which broker MarketCoach talks to.
+    #   "ibkr" — Interactive Brokers via ib_insync (default for unknown/unset).
+    #            Requires a local IB Gateway process on the same machine.
+    #   "none" — explicit opt-out. Trading endpoints return 503; analysis
+    #            features work normally. Used by cloud-hosted instances that
+    #            can't reach a local Gateway.
     # The selection happens once at startup; switch by editing .env and restarting.
-    broker_provider: str = "alpaca"
-
-    # ── Alpaca credentials ───────────────────────────────────────────────────
-    alpaca_api_key: str = ""
-    alpaca_secret_key: str = ""
-    alpaca_base_url: str = "https://paper-api.alpaca.markets"
+    broker_provider: str = "ibkr"
 
     # ── IBKR connection (only used when broker_provider == "ibkr") ───────────
     # IBKR requires a local IB Gateway / TWS process, not direct internet.
-    # Default port 7497 = paper, 7496 = live. Client ID can be anything 1-32
-    # but must be unique per simultaneously-connected client.
+    # Gateway 10+ ports: 4002 = paper, 4001 = live.
+    # Older IB Gateway / TWS: 7497 = paper, 7496 = live.
+    # Client ID can be anything 1-32 but must be unique per simultaneously-
+    # connected client.
     ibkr_host: str = "127.0.0.1"
     ibkr_port: int = 7497
     ibkr_client_id: int = 1
@@ -32,7 +41,8 @@ class Settings(BaseSettings):
     # Defaults to paper. Going live requires BOTH flags flipped — a single
     # misconfiguration (env var typo, accidental merge) can never put real
     # money at risk on its own. Defence in depth. Applies to whichever broker
-    # is active — the gate is broker-agnostic.
+    # is active — the gate is broker-agnostic despite the historical names
+    # (ALPACA_* in env, dating from when Alpaca was the only broker).
     alpaca_paper: bool = True
     # Must equal the exact string "I understand this uses real capital" for
     # live mode to activate. Deliberately verbose so nobody sets it by reflex.

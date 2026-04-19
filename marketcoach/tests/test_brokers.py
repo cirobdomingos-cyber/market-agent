@@ -1,13 +1,12 @@
 """
 Tests for the broker abstraction layer.
 
-Three layers:
-  1. Factory selection — alpaca/ibkr/unknown picks the right class
-  2. AlpacaBroker behaviour — disconnected stubs, paper guard
-  3. IBKRBroker behaviour — disconnected stubs, paper guard, mocked ib_insync
+Two layers after the Alpaca removal:
+  1. Factory selection — ibkr / none / alpaca (error) / unknown (fallback)
+  2. IBKRBroker behaviour — disconnected stubs, paper guard, mocked ib_insync
 
-We never hit a real Alpaca or IBKR API. Tests run on a developer machine
-that may not have ib_insync installed at all.
+We never hit a real IBKR API. Tests run on a developer machine that may
+not have ib_insync installed at all (the import is lazy inside IBKRBroker).
 """
 
 import sys
@@ -17,7 +16,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from backend.brokers import BrokerClient, OrderResult, get_broker, init_broker
-from backend.brokers.alpaca import AlpacaBroker
 from backend.brokers.factory import reset_broker
 from backend.brokers.ibkr import IBKRBroker
 
@@ -69,19 +67,29 @@ class TestBrokerFactoryNone:
 # ── Factory ────────────────────────────────────────────────────────────────
 
 class TestBrokerFactory:
-    def test_init_alpaca_returns_alpaca_instance(self):
-        broker = init_broker("alpaca", api_key="", secret_key="", paper=True)
-        assert isinstance(broker, AlpacaBroker)
-        assert get_broker() is broker
-
     def test_init_ibkr_returns_ibkr_instance(self):
         broker = init_broker("ibkr", host="127.0.0.1", port=7497, client_id=1)
         assert isinstance(broker, IBKRBroker)
         assert get_broker() is broker
 
-    def test_unknown_provider_falls_back_to_alpaca(self):
-        broker = init_broker("garbage", api_key="", secret_key="")
-        assert isinstance(broker, AlpacaBroker)
+    def test_init_alpaca_raises_with_removal_message(self):
+        """
+        BROKER_PROVIDER=alpaca should fail loudly with a message that
+        points the user at the fix (switch to ibkr or none). Silent
+        fallback would hide stale .env files from the user.
+        """
+        with pytest.raises(ValueError, match="was removed"):
+            init_broker("alpaca", api_key="", secret_key="", paper=True)
+
+    def test_unknown_provider_falls_back_to_ibkr(self):
+        """
+        Anything not in the known set falls back to IBKR with a warning.
+        IBKR is the safer default because it's the only currently supported
+        live-trading integration; a broken config still leaves the user
+        pointed at the right broker when they fix it.
+        """
+        broker = init_broker("garbage", host="127.0.0.1", port=7497)
+        assert isinstance(broker, IBKRBroker)
 
     def test_provider_name_case_insensitive(self):
         broker = init_broker("IBKR", host="127.0.0.1", port=7497)
@@ -92,60 +100,10 @@ class TestBrokerFactory:
         assert get_broker() is None
 
     def test_init_replaces_singleton(self):
-        a = init_broker("alpaca", api_key="", secret_key="")
-        b = init_broker("ibkr", host="127.0.0.1", port=7497)
+        a = init_broker("ibkr", host="127.0.0.1", port=7497, client_id=1)
+        b = init_broker("none")
         assert get_broker() is b
         assert get_broker() is not a
-
-
-# ── AlpacaBroker ───────────────────────────────────────────────────────────
-
-class TestAlpacaBroker:
-    def test_disconnected_when_no_credentials(self):
-        b = AlpacaBroker(api_key="", secret_key="", paper=True)
-        assert b.is_connected() is False
-        assert b.get_account()["status"] == "disconnected"
-        assert b.get_positions() == []
-        assert b.get_order_history() == []
-
-    def test_implements_abstract_interface(self):
-        b = AlpacaBroker()
-        assert isinstance(b, BrokerClient)
-
-    def test_paper_guard_on_place_order(self):
-        """place_order with paper_only=True on a live broker must raise."""
-        b = AlpacaBroker(api_key="", secret_key="", paper=False)
-        with pytest.raises(ValueError, match="paper-only but broker is in live"):
-            b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=True)
-
-    def test_disconnected_place_order_returns_error_result(self):
-        b = AlpacaBroker(api_key="", secret_key="", paper=True)
-        result = b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=True)
-        assert isinstance(result, OrderResult)
-        assert result.status == "error_disconnected"
-        assert result.is_paper is True
-
-    def test_place_order_rejects_limit_without_price(self):
-        b = AlpacaBroker(api_key="", secret_key="", paper=True)
-        with pytest.raises(ValueError, match="limit_price is required"):
-            b.place_order(
-                ticker="NVDA",
-                qty=1,
-                side="buy",
-                paper_only=True,
-                order_type="limit",
-            )
-
-    def test_place_order_rejects_unknown_order_type(self):
-        b = AlpacaBroker(api_key="", secret_key="", paper=True)
-        with pytest.raises(ValueError, match="order_type must be"):
-            b.place_order(
-                ticker="NVDA",
-                qty=1,
-                side="buy",
-                paper_only=True,
-                order_type="stop",
-            )
 
 
 # ── IBKRBroker ─────────────────────────────────────────────────────────────
@@ -303,16 +261,6 @@ class TestPendingOrdersAndCancel:
     IBKR cancel happy path via a mocked IB instance.
     """
 
-    def test_alpaca_disconnected_get_pending_returns_empty(self):
-        b = AlpacaBroker(api_key="", secret_key="", paper=True)
-        assert b.get_pending_orders() == []
-
-    def test_alpaca_disconnected_cancel_returns_error(self):
-        b = AlpacaBroker(api_key="", secret_key="", paper=True)
-        result = b.cancel_order("abc-123")
-        assert "error" in result
-        assert result["order_id"] == "abc-123"
-
     def test_ibkr_disconnected_get_pending_returns_empty(self):
         b = IBKRBroker()
         assert b.get_pending_orders() == []
@@ -396,40 +344,6 @@ class TestScaleOutBracketSignature:
     explicitly raise NotImplementedError when target_qty < qty so callers
     don't silently fall back to an all-out bracket with the wrong qty.
     """
-
-    def test_alpaca_raises_notimplemented_on_scale_out(self):
-        b = AlpacaBroker(api_key="", secret_key="", paper=True)
-        with pytest.raises(NotImplementedError, match="[Ss]cale-out"):
-            b.place_bracket_order(
-                ticker="SPY",
-                qty=2,
-                side="buy",
-                limit_price=540.0,
-                stop_loss_price=534.0,
-                take_profit_price=552.0,
-                paper_only=True,
-                target_qty=1,
-            )
-
-    def test_alpaca_accepts_target_qty_equal_to_qty(self):
-        """
-        target_qty == qty is not scale-out — it's the classic all-out
-        bracket expressed explicitly. Must not raise. Since the broker
-        isn't connected we get error_disconnected; the point is we don't
-        hit the NotImplementedError path.
-        """
-        b = AlpacaBroker(api_key="", secret_key="", paper=True)
-        result = b.place_bracket_order(
-            ticker="SPY",
-            qty=2,
-            side="buy",
-            limit_price=540.0,
-            stop_loss_price=534.0,
-            take_profit_price=552.0,
-            paper_only=True,
-            target_qty=2,
-        )
-        assert result.status == "error_disconnected"
 
     def test_ibkr_scale_out_places_four_orders(self):
         """

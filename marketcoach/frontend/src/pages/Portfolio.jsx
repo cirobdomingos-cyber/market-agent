@@ -207,19 +207,27 @@ export default function Portfolio() {
       {/* Positions */}
       <div>
         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
-          Paper Positions ({positions.length})
+          Positions ({positions.length})
         </h2>
         {!isConnected ? (
           <div className="border border-gray-800 rounded-lg p-6 text-center">
             <p className="text-gray-400 text-sm">
-              Alpaca not connected. Add <code className="text-indigo-400">ALPACA_API_KEY</code> and{' '}
-              <code className="text-indigo-400">ALPACA_SECRET_KEY</code> to .env.
+              Broker not connected. Start{' '}
+              <a
+                href="https://www.interactivebrokers.com/en/trading/ibgateway-stable.php"
+                className="text-indigo-400 hover:underline"
+                target="_blank"
+                rel="noreferrer"
+              >
+                IB Gateway
+              </a>{' '}
+              locally and set <code className="text-indigo-400">BROKER_PROVIDER=ibkr</code>{' '}
+              in <code className="text-indigo-400">.env</code>.
             </p>
             <p className="text-gray-500 text-xs mt-2">
-              Get free paper trading keys at{' '}
-              <a href="https://alpaca.markets" className="text-indigo-400 hover:underline" target="_blank" rel="noreferrer">
-                alpaca.markets
-              </a>
+              This environment may also be running with{' '}
+              <code className="text-gray-400">BROKER_PROVIDER=none</code>{' '}
+              (trading disabled by design, e.g. cloud-hosted analysis).
             </p>
           </div>
         ) : positions.length > 0 ? (

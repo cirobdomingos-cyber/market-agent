@@ -6,7 +6,7 @@ The /orders/confirm endpoint is the most consequential thing in the codebase
 safety gate, every rejection reason, and the persistence audit trail.
 
 The broker client is mocked at the get_broker level so we never
-hit the real Alpaca/IBKR API.
+hit the real broker API.
 """
 
 from unittest.mock import patch, MagicMock
@@ -77,8 +77,8 @@ def client(db):
 
 
 @pytest.fixture()
-def mock_alpaca():
-    """Build a mocked Alpaca client that always succeeds with a filled order."""
+def mock_broker():
+    """Build a mocked broker client that always succeeds with a filled order."""
     mock = MagicMock()
     mock.get_positions.return_value = []
     mock.get_account.return_value = {
@@ -89,7 +89,7 @@ def mock_alpaca():
         "paper": True,
     }
     mock.place_order.return_value = OrderResult(
-        order_id="alpaca-order-123",
+        order_id="broker-order-123",
         ticker="NVDA",
         qty=10.0,
         side="buy",
@@ -168,11 +168,11 @@ class TestSchemaValidation:
 # ── Live mode gate ─────────────────────────────────────────────────────────
 
 class TestLiveModeGate:
-    def test_paper_mode_does_not_require_confirmation(self, client, mock_alpaca, monkeypatch):
+    def test_paper_mode_does_not_require_confirmation(self, client, mock_broker, monkeypatch):
         monkeypatch.setattr(settings, "alpaca_paper", True)
         monkeypatch.setattr(settings, "alpaca_live_confirmation", "")
 
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(confirm_live_capital=False),
@@ -180,7 +180,7 @@ class TestLiveModeGate:
         # Should pass live-mode check (we're in paper)
         assert resp.status_code == 200
 
-    def test_live_mode_blocks_without_confirmation(self, client, mock_alpaca, monkeypatch):
+    def test_live_mode_blocks_without_confirmation(self, client, mock_broker, monkeypatch):
         monkeypatch.setattr(settings, "alpaca_paper", False)
         monkeypatch.setattr(
             settings,
@@ -188,7 +188,7 @@ class TestLiveModeGate:
             Settings.LIVE_CONFIRMATION_PHRASE,
         )
 
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(confirm_live_capital=False),
@@ -196,7 +196,7 @@ class TestLiveModeGate:
         assert resp.status_code == 403
         assert "live mode" in resp.json()["detail"].lower()
 
-    def test_live_mode_allows_with_confirmation(self, client, mock_alpaca, monkeypatch):
+    def test_live_mode_allows_with_confirmation(self, client, mock_broker, monkeypatch):
         monkeypatch.setattr(settings, "alpaca_paper", False)
         monkeypatch.setattr(
             settings,
@@ -204,7 +204,7 @@ class TestLiveModeGate:
             Settings.LIVE_CONFIRMATION_PHRASE,
         )
 
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(confirm_live_capital=True),
@@ -215,17 +215,17 @@ class TestLiveModeGate:
 # ── Connection gate ────────────────────────────────────────────────────────
 
 class TestConnectionGate:
-    def test_no_alpaca_client_returns_503(self, client):
+    def test_no_broker_client_returns_503(self, client):
         with patch("backend.main.get_broker", return_value=None):
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 503
-        assert "alpaca" in resp.json()["detail"].lower()
+        assert "broker not configured" in resp.json()["detail"].lower()
 
 
 # ── Daily cap gate ─────────────────────────────────────────────────────────
 
 class TestDailyCap:
-    def test_cap_enforced_after_threshold(self, client, db, mock_alpaca, monkeypatch):
+    def test_cap_enforced_after_threshold(self, client, db, mock_broker, monkeypatch):
         # Pre-populate executed_orders with 20 entries from today
         from backend.main import ORDER_DAILY_CAP
         for i in range(ORDER_DAILY_CAP):
@@ -239,7 +239,7 @@ class TestDailyCap:
                 is_paper=True,
             )
 
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post("/orders/confirm", json=_valid_request())
 
         # The 21st attempt is rejected (with persisted row, status 200 + body)
@@ -252,12 +252,12 @@ class TestDailyCap:
 # ── Whitelist gate ─────────────────────────────────────────────────────────
 
 class TestWhitelistGate:
-    def test_unrelated_ticker_rejected_when_no_advisor_context(self, client, db, mock_alpaca):
+    def test_unrelated_ticker_rejected_when_no_advisor_context(self, client, db, mock_broker):
         """Direct API calls without advisor_session_id + rationale still
         hit the whitelist gate. This is the safety path for anything that
         bypasses the normal UI flow."""
         _seed_watchlist(db, ["AAPL", "MSFT"])
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(
@@ -271,37 +271,37 @@ class TestWhitelistGate:
         assert body["status"] == "rejected"
         assert "whitelist" in body["rejection_reason"].lower()
 
-    def test_watchlist_ticker_passes(self, client, db, mock_alpaca):
+    def test_watchlist_ticker_passes(self, client, db, mock_broker):
         _seed_watchlist(db, ["NVDA", "AAPL"])
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] in ("filled", "accepted")
 
     def test_position_ticker_passes_even_without_watchlist(
-        self, client, db, mock_alpaca
+        self, client, db, mock_broker
     ):
         _seed_watchlist(db, ["AAPL"])  # NVDA not on watchlist
-        mock_alpaca.get_positions.return_value = [{"ticker": "NVDA"}]
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        mock_broker.get_positions.return_value = [{"ticker": "NVDA"}]
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 200
         assert resp.json()["status"] in ("filled", "accepted")
 
     def test_advisor_trade_auto_whitelists_new_ticker(
-        self, client, db, mock_alpaca
+        self, client, db, mock_broker
     ):
         """A trade from the Advisor UI (has advisor_session_id + rationale)
         for a ticker NOT on the watchlist should auto-add it and proceed.
         The whole chain (thesis typed, card clicked, modal confirmed) is
         sufficient deliberate intent."""
         _seed_watchlist(db, ["AAPL"])  # SLV not on watchlist
-        mock_alpaca.place_order.return_value = OrderResult(
+        mock_broker.place_order.return_value = OrderResult(
             order_id="order-slv-1", ticker="SLV", qty=10.0, side="buy",
             status="filled", is_paper=True, fill_price=28.50,
         )
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(
@@ -322,14 +322,14 @@ class TestWhitelistGate:
         assert "auto-added" in (slv.notes or "").lower()
 
     def test_advisor_auto_whitelist_needs_both_session_and_rationale(
-        self, client, db, mock_alpaca
+        self, client, db, mock_broker
     ):
         """Auto-whitelist requires BOTH advisor_session_id AND rationale.
         A request with only one (e.g., a half-built direct API call) still
         hits the rejection path — defence against the case where someone
         tries to bypass with a fake session id but forgets the rationale."""
         _seed_watchlist(db, ["AAPL"])
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             # Session without rationale → rejected
             resp = client.post(
                 "/orders/confirm",
@@ -342,7 +342,7 @@ class TestWhitelistGate:
         assert resp.json()["status"] == "rejected"
         assert "SLV" not in crud.get_watchlist_tickers_set(db)
 
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             # Rationale without session → rejected
             resp = client.post(
                 "/orders/confirm",
@@ -358,9 +358,9 @@ class TestWhitelistGate:
 # ── 20% portfolio gate ─────────────────────────────────────────────────────
 
 class TestPortfolioGate:
-    def test_oversized_buy_rejected(self, client, mock_alpaca):
+    def test_oversized_buy_rejected(self, client, mock_broker):
         # 100 shares × $450 = $45,000 > 20% of $100k portfolio ($20k)
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(qty=100, limit_price=450.00),
@@ -370,24 +370,24 @@ class TestPortfolioGate:
         assert body["status"] == "rejected"
         assert "20%" in body["rejection_reason"]
 
-    def test_within_limit_passes(self, client, mock_alpaca):
+    def test_within_limit_passes(self, client, mock_broker):
         # 10 × $450 = $4,500 < $20k → ok
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post("/orders/confirm", json=_valid_request())
         assert resp.status_code == 200
         assert resp.json()["status"] in ("filled", "accepted")
 
-    def test_oversized_sell_allowed(self, client, mock_alpaca):
+    def test_oversized_sell_allowed(self, client, mock_broker):
         """The 20% rule is a position-SIZING cap meant to prevent buys
         from blowing up concentration risk. Sells of existing longs
         reduce risk — they must never be rejected by this gate, even
         when the notional is technically > 20% (common for 100% closes
         of big positions)."""
-        mock_alpaca.place_order.return_value = OrderResult(
+        mock_broker.place_order.return_value = OrderResult(
             order_id="sell-big-1", ticker="NVDA", qty=100, side="sell",
             status="filled", is_paper=True, fill_price=460.0,
         )
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=_valid_request(
@@ -405,23 +405,23 @@ class TestPortfolioGate:
 # ── Persistence ────────────────────────────────────────────────────────────
 
 class TestPersistence:
-    def test_successful_order_persisted(self, client, db, mock_alpaca):
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+    def test_successful_order_persisted(self, client, db, mock_broker):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             client.post("/orders/confirm", json=_valid_request())
         orders = crud.list_executed_orders(db)
         assert len(orders) == 1
         assert orders[0].ticker == "NVDA"
-        assert orders[0].alpaca_order_id == "alpaca-order-123"
+        assert orders[0].alpaca_order_id == "broker-order-123"
         assert orders[0].fill_price == 450.12
         assert orders[0].status == "filled"
         assert orders[0].rationale == "Bullish breakout test"
         assert orders[0].advisor_session_id == "advisor-test"
 
     def test_rejected_order_persisted_with_reason(
-        self, client, db, mock_alpaca
+        self, client, db, mock_broker
     ):
         _seed_watchlist(db, ["AAPL"])  # ZZZZ will be off-whitelist
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             # No advisor context → rejection path stays active
             client.post(
                 "/orders/confirm",
@@ -437,9 +437,9 @@ class TestPersistence:
         assert orders[0].alpaca_order_id is None
         assert "whitelist" in orders[0].rejection_reason.lower()
 
-    def test_alpaca_failure_persisted(self, client, db, mock_alpaca):
-        mock_alpaca.place_order.side_effect = Exception("Alpaca 500: server error")
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+    def test_broker_failure_persisted(self, client, db, mock_broker):
+        mock_broker.place_order.side_effect = Exception("Alpaca 500: server error")
+        with patch("backend.main.get_broker", return_value=mock_broker):
             client.post("/orders/confirm", json=_valid_request())
         orders = crud.list_executed_orders(db)
         assert len(orders) == 1
@@ -523,14 +523,14 @@ class TestScaleOutBracketEndpoint:
         base.update(overrides)
         return base
 
-    def test_scale_out_persists_target_qty_and_fresh_state(self, client, db, mock_alpaca):
+    def test_scale_out_persists_target_qty_and_fresh_state(self, client, db, mock_broker):
         from backend.db.models import ExecutedOrder
 
-        mock_alpaca.place_bracket_order.return_value = OrderResult(
+        mock_broker.place_bracket_order.return_value = OrderResult(
             order_id="ord-123", ticker="NVDA", qty=2.0, side="buy",
             status="accepted", is_paper=True, fill_price=None,
         )
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=self._bracket_request(qty=2, target_qty=1),
@@ -542,30 +542,30 @@ class TestScaleOutBracketEndpoint:
         assert row.target_qty == 1.0
         assert row.bracket_state == "fresh"
 
-    def test_scale_out_forwards_target_qty_to_broker(self, client, mock_alpaca):
-        mock_alpaca.place_bracket_order.return_value = OrderResult(
+    def test_scale_out_forwards_target_qty_to_broker(self, client, mock_broker):
+        mock_broker.place_bracket_order.return_value = OrderResult(
             order_id="ord", ticker="NVDA", qty=4.0, side="buy",
             status="accepted", is_paper=True, fill_price=None,
         )
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             client.post(
                 "/orders/confirm",
                 json=self._bracket_request(qty=4, target_qty=2),
             )
-        mock_alpaca.place_bracket_order.assert_called_once()
-        kwargs = mock_alpaca.place_bracket_order.call_args.kwargs
+        mock_broker.place_bracket_order.assert_called_once()
+        kwargs = mock_broker.place_bracket_order.call_args.kwargs
         assert kwargs["target_qty"] == 2
         assert kwargs["qty"] == 4
 
-    def test_all_out_bracket_persists_plain_bracket_class(self, client, db, mock_alpaca):
+    def test_all_out_bracket_persists_plain_bracket_class(self, client, db, mock_broker):
         """Classic bracket (no target_qty) still works — order_class='bracket', bracket_state=null."""
         from backend.db.models import ExecutedOrder
 
-        mock_alpaca.place_bracket_order.return_value = OrderResult(
+        mock_broker.place_bracket_order.return_value = OrderResult(
             order_id="ord", ticker="NVDA", qty=2.0, side="buy",
             status="accepted", is_paper=True, fill_price=None,
         )
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post("/orders/confirm", json=self._bracket_request(qty=2))
         assert resp.status_code == 200, resp.text
 
@@ -574,7 +574,7 @@ class TestScaleOutBracketEndpoint:
         assert row.target_qty is None
         assert row.bracket_state is None
 
-    def test_target_qty_equal_to_qty_normalises_to_none(self, client, db, mock_alpaca):
+    def test_target_qty_equal_to_qty_normalises_to_none(self, client, db, mock_broker):
         """
         Scale-out with target_qty == qty is a no-op (same as all-out).
         Endpoint normalises the field to None so downstream doesn't have
@@ -582,11 +582,11 @@ class TestScaleOutBracketEndpoint:
         """
         from backend.db.models import ExecutedOrder
 
-        mock_alpaca.place_bracket_order.return_value = OrderResult(
+        mock_broker.place_bracket_order.return_value = OrderResult(
             order_id="ord", ticker="NVDA", qty=2.0, side="buy",
             status="accepted", is_paper=True, fill_price=None,
         )
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             client.post(
                 "/orders/confirm",
                 json=self._bracket_request(qty=2, target_qty=2),
@@ -596,8 +596,8 @@ class TestScaleOutBracketEndpoint:
         assert row.target_qty is None
         assert row.bracket_state is None
 
-    def test_fractional_target_qty_rejected(self, client, mock_alpaca):
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+    def test_fractional_target_qty_rejected(self, client, mock_broker):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=self._bracket_request(qty=4, target_qty=1.5),
@@ -605,8 +605,8 @@ class TestScaleOutBracketEndpoint:
         assert resp.status_code == 422
         assert "whole number" in resp.json()["detail"].lower()
 
-    def test_fractional_qty_with_scale_out_rejected(self, client, mock_alpaca):
-        with patch("backend.main.get_broker", return_value=mock_alpaca):
+    def test_fractional_qty_with_scale_out_rejected(self, client, mock_broker):
+        with patch("backend.main.get_broker", return_value=mock_broker):
             resp = client.post(
                 "/orders/confirm",
                 json=self._bracket_request(qty=2.5, target_qty=1),
