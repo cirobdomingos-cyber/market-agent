@@ -1,5 +1,15 @@
 import { useEffect, useState } from 'react'
 import axios from 'axios'
+import {
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  ReferenceLine,
+} from 'recharts'
 
 const API = '/api'
 const REFRESH_MS = 60_000  // slower than Markets — trade perf doesn't change by the second
@@ -79,8 +89,87 @@ export default function Performance() {
 
       <HeroKpiRow data={data} />
       <SecondaryKpiRow data={data} />
+      <EquityCurveChart points={data.equity_curve} />
       <AdvisorAttributionCard data={data} />
       <RecentTradesTable trades={data.recent_trades} />
+    </div>
+  )
+}
+
+function EquityCurveChart({ points }) {
+  if (!points || points.length === 0) {
+    return null  // hero cards already show "0 closed trades" — don't double up
+  }
+  // Color the chart by the sign of the latest cumulative P&L. Green if
+  // we end positive overall, red if negative. Matches the hero Realised
+  // P&L card's color so the page tells one coherent story.
+  const final = points[points.length - 1].cumulative_pnl
+  const isProfit = final >= 0
+  const color = isProfit ? '#10b981' : '#f43f5e'
+
+  return (
+    <div>
+      <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
+        Cumulative realised P&amp;L
+      </h2>
+      <div className="rounded-lg border border-gray-800 bg-gray-900 p-4 h-[280px]">
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={points} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+            <defs>
+              <linearGradient id="pnlFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={color} stopOpacity={0.3} />
+                <stop offset="100%" stopColor={color} stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+            <XAxis
+              dataKey="x"
+              stroke="#6b7280"
+              tick={{ fontSize: 11, fill: '#9ca3af' }}
+              minTickGap={40}
+              tickFormatter={(iso) => new Date(iso).toLocaleDateString()}
+            />
+            <YAxis
+              stroke="#6b7280"
+              tick={{ fontSize: 11, fill: '#9ca3af' }}
+              tickFormatter={(v) => `$${v.toLocaleString()}`}
+            />
+            <Tooltip
+              contentStyle={{
+                backgroundColor: '#111827',
+                border: '1px solid #374151',
+                borderRadius: '6px',
+                fontSize: '12px',
+              }}
+              labelFormatter={(iso) => new Date(iso).toLocaleString()}
+              formatter={(_value, name, props) => {
+                const p = props.payload
+                if (!p) return ['—', name]
+                // Two tooltip lines: cumulative + that trade's contribution
+                return [
+                  `$${p.cumulative_pnl.toLocaleString()} (${
+                    p.trade_pnl >= 0 ? '+' : ''
+                  }$${p.trade_pnl.toLocaleString()} on ${p.ticker})`,
+                  'Cumulative P&L',
+                ]
+              }}
+              labelStyle={{ color: '#9ca3af' }}
+            />
+            <ReferenceLine y={0} stroke="#374151" strokeDasharray="3 3" />
+            <Area
+              type="monotone"
+              dataKey="cumulative_pnl"
+              stroke={color}
+              strokeWidth={2}
+              fill="url(#pnlFill)"
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      <p className="text-xs text-gray-500 mt-2">
+        Each point is a closed live trade. Line steps when P&amp;L realises —
+        open positions don't move it until they close.
+      </p>
     </div>
   )
 }

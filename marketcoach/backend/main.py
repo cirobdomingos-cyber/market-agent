@@ -430,6 +430,7 @@ def get_performance(db: Session = Depends(get_db)):
             "advised_trades_count": 0,
             "advised_win_rate_pct": None,
             "recent_trades": [],
+            "equity_curve": [],
         }
 
     winners = [t for t in closed if t.pnl_amount > 0]
@@ -490,7 +491,39 @@ def get_performance(db: Session = Depends(get_db)):
             if advised else None
         ),
         "recent_trades": [_serialise_trade(t) for t in closed[:50]],
+        # Cumulative realised P&L curve for the chart. Ordered oldest
+        # → newest so the line reads left-to-right like every other
+        # time-series view in the app. Each point is the running sum
+        # after that trade closed. No fills between trades — the line
+        # only steps when something actually realises P&L.
+        "equity_curve": _build_equity_curve(closed),
     }
+
+
+def _build_equity_curve(closed: list) -> list[dict]:
+    """
+    Turn a list of closed trades into a cumulative realised-P&L series.
+    Oldest first so the chart runs left-to-right. Each point carries:
+      - x: ISO timestamp when the trade closed
+      - cumulative_pnl: running sum of pnl_amount up to and including
+        this trade
+      - trade_pnl: this trade's contribution (for tooltip detail)
+      - ticker: the closed trade's ticker (tooltip)
+    """
+    by_close = sorted(closed, key=lambda t: t.closed_at or t.opened_at)
+    running = 0.0
+    points = []
+    for t in by_close:
+        if t.pnl_amount is None:
+            continue
+        running += t.pnl_amount
+        points.append({
+            "x": (t.closed_at or t.opened_at).isoformat(),
+            "cumulative_pnl": round(running, 2),
+            "trade_pnl": round(t.pnl_amount, 2),
+            "ticker": t.ticker,
+        })
+    return points
 
 
 @app.post("/pipeline/run", response_model=PipelineRunResponse)

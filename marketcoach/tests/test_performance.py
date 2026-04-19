@@ -293,3 +293,58 @@ class TestPerformanceRecentTrades:
         body = client.get("/performance").json()
         assert len(body["recent_trades"]) == 50
         assert body["closed_trades_count"] == 60
+
+
+class TestPerformanceEquityCurve:
+    """
+    Cumulative realised P&L series — one point per closed trade, ordered
+    oldest first so the chart reads left-to-right, each point carrying
+    the running sum after that trade settled.
+    """
+
+    def test_empty_curve_on_no_trades(self, client):
+        body = client.get("/performance").json()
+        assert body["equity_curve"] == []
+
+    def test_curve_is_cumulative_and_oldest_first(self, client, db):
+        now = datetime.now(timezone.utc)
+        # Seed in reverse chronological order to verify sorting
+        _seed_trade(
+            db, "NEW", 10, 100.0, 90.0, pnl=-100.0, pnl_pct=-10.0, days_held=1,
+            closed_at=now,
+        )
+        _seed_trade(
+            db, "MID", 10, 100.0, 120.0, pnl=200.0, pnl_pct=20.0, days_held=1,
+            closed_at=now - timedelta(days=3),
+        )
+        _seed_trade(
+            db, "OLD", 10, 100.0, 110.0, pnl=100.0, pnl_pct=10.0, days_held=1,
+            closed_at=now - timedelta(days=5),
+        )
+
+        curve = client.get("/performance").json()["equity_curve"]
+        assert len(curve) == 3
+        # Oldest first: OLD (+100), MID (+200), NEW (-100)
+        assert [p["ticker"] for p in curve] == ["OLD", "MID", "NEW"]
+        # Cumulative: 100, 300, 200
+        assert curve[0]["cumulative_pnl"] == 100.0
+        assert curve[1]["cumulative_pnl"] == 300.0
+        assert curve[2]["cumulative_pnl"] == 200.0
+        # Each point also carries its own contribution
+        assert curve[0]["trade_pnl"] == 100.0
+        assert curve[1]["trade_pnl"] == 200.0
+        assert curve[2]["trade_pnl"] == -100.0
+
+    def test_curve_excludes_paper_trades(self, client, db):
+        """Live-only filter applies to the curve too."""
+        _seed_trade(
+            db, "LIVE", 10, 100.0, 110.0, pnl=100.0, pnl_pct=10.0, days_held=1,
+            is_paper=False,
+        )
+        _seed_trade(
+            db, "PAPER", 10, 100.0, 200.0, pnl=1000.0, pnl_pct=100.0, days_held=1,
+            is_paper=True,
+        )
+        curve = client.get("/performance").json()["equity_curve"]
+        assert len(curve) == 1
+        assert curve[0]["ticker"] == "LIVE"
