@@ -132,6 +132,24 @@ class TestTradingAdvisorPrompt:
         assert "{portfolio_value}" not in STABLE_INTRO_FRAMEWORK
         assert "{positions}" not in STABLE_INTRO_FRAMEWORK
 
+    def test_stable_prefix_teaches_atr_stop_placement(self):
+        """
+        The advisor MUST be told to use the suggest_bracket tool as the
+        anchor for every bracket proposal. Without this guidance, the
+        advisor reverts to picking stops from its head — the whole point
+        of the ATR tool is to remove that inconsistency. Regression guard
+        so a future prompt edit doesn't silently drop the rule.
+        """
+        assert "suggest_bracket" in STABLE_INTRO_FRAMEWORK
+        assert "ATR" in STABLE_INTRO_FRAMEWORK
+        # The "ADJUST" emphasis keeps judgment in the loop — we don't
+        # want the advisor to blindly use the ATR number when a real
+        # technical level tells a different story.
+        assert "ADJUST" in STABLE_INTRO_FRAMEWORK
+        # Fallback path documented so the advisor doesn't panic when
+        # yfinance is down.
+        assert "suggested_fallback" in STABLE_INTRO_FRAMEWORK or "2% rule" in STABLE_INTRO_FRAMEWORK
+
 
 class TestBrokerReadTool:
     """Broker-agnostic read-only tool must refuse writes and expose the right surface."""
