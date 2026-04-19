@@ -113,10 +113,10 @@ class TestAlpacaBroker:
         assert isinstance(b, BrokerClient)
 
     def test_paper_guard_on_place_order(self):
-        """place_order with paper_only=False AND paper=False must raise."""
+        """place_order with paper_only=True on a live broker must raise."""
         b = AlpacaBroker(api_key="", secret_key="", paper=False)
-        with pytest.raises(ValueError, match="Live trading"):
-            b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=False)
+        with pytest.raises(ValueError, match="paper-only but broker is in live"):
+            b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=True)
 
     def test_disconnected_place_order_returns_error_result(self):
         b = AlpacaBroker(api_key="", secret_key="", paper=True)
@@ -167,9 +167,10 @@ class TestIBKRBroker:
         assert isinstance(b, BrokerClient)
 
     def test_paper_guard_on_place_order(self):
+        """place_order with paper_only=True on a live broker must raise."""
         b = IBKRBroker(paper=False)
-        with pytest.raises(ValueError, match="Live trading"):
-            b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=False)
+        with pytest.raises(ValueError, match="paper-only but broker is in live"):
+            b.place_order(ticker="NVDA", qty=1, side="buy", paper_only=True)
 
     def test_place_order_rejects_limit_without_price(self):
         b = IBKRBroker(paper=True)
