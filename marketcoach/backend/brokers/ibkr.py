@@ -380,10 +380,10 @@ class IBKRBroker(BrokerClient):
             raise ValueError(f"order_type must be 'market' or 'limit', got {order_type!r}")
         if order_type == "limit" and limit_price is None:
             raise ValueError("limit_price is required when order_type='limit'")
-        if not paper_only and not self.paper:
+        if paper_only and not self.paper:
             raise ValueError(
-                "Live trading requires explicit user confirmation. "
-                "Use the paper IBKR account or set paper_only=True."
+                "Caller requested paper-only but broker is in live mode. "
+                "Pass paper_only=False to confirm live trading intent."
             )
 
         if not self._ensure_connected():
@@ -476,10 +476,10 @@ class IBKRBroker(BrokerClient):
         """
         if side != "buy":
             raise ValueError("Bracket orders only support BUY (long entries) in v1")
-        if not paper_only and not self.paper:
+        if paper_only and not self.paper:
             raise ValueError(
-                "Live trading requires explicit user confirmation. "
-                "Use the paper IBKR account or set paper_only=True."
+                "Caller requested paper-only but broker is in live mode. "
+                "Pass paper_only=False to confirm live trading intent."
             )
         if not self._ensure_connected():
             return OrderResult(
