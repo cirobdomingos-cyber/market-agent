@@ -627,3 +627,63 @@ class TestReactionGateIntegration:
             }])
 
         orch.run_advisor.assert_called_once()
+
+
+# ── 5. Intelligence pipeline folding (swing-trader mode) ────────────────────
+
+class TestWeeklyPlanIntelligenceFolding:
+    """
+    When intelligence_pipeline_enabled=False, run_weekly_plan must call
+    run_intelligence_pipeline() before generating the plan so signals stay
+    fresh. When the flag is True (day-trader default), the pipeline runs
+    on its own cadence and the weekly plan uses existing signals.
+    """
+
+    def test_folding_runs_pipeline_when_flag_disabled(self, db):
+        orch = _make_orchestrator(db)
+        orch.run_intelligence_pipeline = MagicMock(return_value={})
+        orch.run_advisor = MagicMock(
+            return_value=AgentResult(success=True, data={"reply": "Weekly plan body"})
+        )
+
+        with patch.object(settings, "intelligence_pipeline_enabled", False):
+            result = orch.run_weekly_plan(trigger="test")
+
+        orch.run_intelligence_pipeline.assert_called_once()
+        orch.run_advisor.assert_called_once()
+        assert result.success is True
+
+    def test_folding_skipped_when_flag_enabled(self, db):
+        orch = _make_orchestrator(db)
+        orch.run_intelligence_pipeline = MagicMock(return_value={})
+        orch.run_advisor = MagicMock(
+            return_value=AgentResult(success=True, data={"reply": "Weekly plan body"})
+        )
+
+        with patch.object(settings, "intelligence_pipeline_enabled", True):
+            orch.run_weekly_plan(trigger="test")
+
+        # Pipeline should NOT run inside weekly plan when the standalone
+        # scheduled job is enabled — that would double-fire it
+        orch.run_intelligence_pipeline.assert_not_called()
+        orch.run_advisor.assert_called_once()
+
+    def test_weekly_plan_continues_on_folded_pipeline_failure(self, db):
+        """
+        Folded pipeline failure must not block the weekly plan — log the
+        warning and press on with whatever signals already exist in the DB.
+        """
+        orch = _make_orchestrator(db)
+        orch.run_intelligence_pipeline = MagicMock(
+            side_effect=Exception("yfinance rate limited")
+        )
+        orch.run_advisor = MagicMock(
+            return_value=AgentResult(success=True, data={"reply": "Plan despite failure"})
+        )
+
+        with patch.object(settings, "intelligence_pipeline_enabled", False):
+            result = orch.run_weekly_plan(trigger="test")
+
+        orch.run_intelligence_pipeline.assert_called_once()
+        orch.run_advisor.assert_called_once()
+        assert result.success is True

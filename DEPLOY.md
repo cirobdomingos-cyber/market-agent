@@ -66,6 +66,20 @@ BROKER_PROVIDER=none
 
 # safety gate — explicit paper, belt and suspenders
 ALPACA_PAPER=true
+
+# swing-trader cost tuning — cuts scheduled spend by ~70% vs day-trader
+# defaults without losing anything a swing trader acts on
+INTELLIGENCE_PIPELINE_ENABLED=false
+POSITION_REVIEWS_ENABLED=false
+NEWS_REACTION_MIN_CONFIDENCE=0.9
+NEWS_REACTIONS_PER_RUN_MAX=2
+NEWS_REACTION_DEDUPE_HOURS=24
+
+# email notifications
+NOTIFICATIONS_ENABLED=true
+SMTP_USER=<your gmail>
+SMTP_PASSWORD=<gmail app password>
+NOTIFICATION_EMAIL=<your gmail>
 ```
 
 `SCHEDULER_TIMEZONE` is a new setting added in Stage D (see below) — without it, APScheduler uses the server's local timezone (UTC on Railway) and the morning brief would fire at 06:00 UTC = 03:00 BRT.

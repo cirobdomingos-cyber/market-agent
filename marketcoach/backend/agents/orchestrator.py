@@ -1107,10 +1107,33 @@ class Orchestrator:
         manual "run now" button in the UI. The generated plan is stored in the
         weekly_plans table so the frontend can display the latest one without
         re-invoking Claude.
+
+        When intelligence_pipeline_enabled is False (swing-trader mode), the
+        news + analysis + trade-idea pipeline runs once inside this method
+        before generating the plan. This folds the pipeline's weekly cadence
+        into the weekly plan itself rather than burning tokens on a schedule
+        that doesn't match a swing trader's actual decision cadence.
         """
         from backend.config import settings as _settings
 
         session_id = _settings.weekly_plan_session_id
+
+        # Fold the intelligence pipeline into the weekly plan when it's
+        # disabled as a standalone scheduled job. Non-fatal on failure —
+        # the plan can still run against whatever signals already exist
+        # in the DB, just without fresh ones for this week.
+        if not _settings.intelligence_pipeline_enabled:
+            try:
+                logger.info(
+                    "Weekly plan: running folded intelligence pipeline first "
+                    "(intelligence_pipeline_enabled=False)"
+                )
+                self.run_intelligence_pipeline()
+            except Exception as exc:
+                logger.warning(
+                    "Folded intelligence pipeline failed, continuing with "
+                    "existing signals: %s", exc,
+                )
 
         theses = crud.get_open_theses(self.db, limit=10)
         signals = crud.get_recent_signals(self.db, hours=168)  # last 7 days

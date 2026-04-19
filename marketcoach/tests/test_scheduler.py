@@ -110,6 +110,34 @@ class TestPositionPollSchedule:
             assert scheduler_module.scheduler.get_job("intelligence_pipeline") is not None
 
 
+class TestIntelligencePipelineToggle:
+    """
+    INTELLIGENCE_PIPELINE_ENABLED=False is the swing-trader knob: drops the
+    standalone 12h news+analysis job and folds it into the weekly plan
+    instead. Single biggest cost knob on Railway — worth a regression guard.
+    """
+
+    def teardown_method(self):
+        if scheduler_module.scheduler.running:
+            scheduler_module.scheduler.shutdown(wait=False)
+        for job in list(scheduler_module.scheduler.get_jobs()):
+            job.remove()
+
+    def test_intelligence_pipeline_registered_when_enabled(self):
+        with patch.object(settings, "intelligence_pipeline_enabled", True):
+            scheduler_module.start_scheduler()
+            assert scheduler_module.scheduler.get_job("intelligence_pipeline") is not None
+
+    def test_intelligence_pipeline_not_registered_when_disabled(self):
+        """Swing-trader mode: no standalone pipeline schedule."""
+        with patch.object(settings, "intelligence_pipeline_enabled", False):
+            scheduler_module.start_scheduler()
+            assert scheduler_module.scheduler.get_job("intelligence_pipeline") is None
+            # Weekly plan + morning brief + position poll should still register
+            assert scheduler_module.scheduler.get_job("weekly_plan") is not None
+            assert scheduler_module.scheduler.get_job("morning_brief") is not None
+
+
 class TestSchedulerTimezone:
     """
     SCHEDULER_TIMEZONE lets cloud deployments pin cron jobs to the user's

@@ -44,7 +44,18 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
     news_cache_ttl_minutes: int = 30
+
+    # Intelligence pipeline (news + analysis + trade ideas) interval when
+    # run as a standalone scheduled job. Irrelevant when
+    # intelligence_pipeline_enabled is False.
     agent_run_interval_hours: int = 4
+
+    # Intelligence pipeline as a standalone scheduled job. Day traders who
+    # want fresh intel every 4h leave True. Swing traders set False — the
+    # pipeline then runs once inside the weekly plan so signals stay fresh
+    # without burning tokens on a schedule that doesn't match their
+    # decision cadence. Biggest single knob for cloud cost on Railway.
+    intelligence_pipeline_enabled: bool = True
 
     # ── Auto news reactions ──────────────────────────────────────────────────
     # When the intelligence pipeline writes high-impact signals, the orchestrator
