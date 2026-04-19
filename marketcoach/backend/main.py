@@ -1386,6 +1386,51 @@ def set_profile_memory(
     }
 
 
+# -- Market data ---------------------------------------------------------------
+#
+# HTTP surface on top of backend.tools.market_data's yfinance functions.
+# Used by the Markets page in the frontend — clickable ticker list + chart.
+# Kept as thin wrappers over _action_quote / _action_price_history rather
+# than duplicating yfinance logic. Errors from market_data bubble up as
+# 404 / 502 so the frontend can show a clean message instead of a spinner.
+
+@app.get("/market-data/{ticker}/quote")
+def get_market_quote(
+    ticker: str,
+    _auth: str = Depends(require_auth),
+):
+    """Current price, change, volume, market cap for a single ticker."""
+    from backend.tools.market_data import execute_market_data
+    result = execute_market_data("quote", ticker=ticker)
+    if "error" in result:
+        raise HTTPException(
+            status_code=404 if "No data" in result["error"] else 502,
+            detail=result["error"],
+        )
+    return result
+
+
+@app.get("/market-data/{ticker}/history")
+def get_market_history(
+    ticker: str,
+    days: int = Query(default=30, ge=1, le=365),
+    _auth: str = Depends(require_auth),
+):
+    """
+    Daily OHLCV history for charting. days=7 for ~1W, 30 for 1M, 90 for 3M,
+    180 for 6M, 365 for 1Y. Frontend picks the number based on the period
+    button the user clicked.
+    """
+    from backend.tools.market_data import execute_market_data
+    result = execute_market_data("price_history", ticker=ticker, days=days)
+    if "error" in result:
+        raise HTTPException(
+            status_code=404 if "No price history" in result["error"] else 502,
+            detail=result["error"],
+        )
+    return result
+
+
 # -- Backtest ------------------------------------------------------------------
 
 @app.post("/backtest/run")

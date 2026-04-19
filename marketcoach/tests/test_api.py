@@ -300,3 +300,96 @@ class TestMorningBriefRoutes:
         assert len(briefs) == 3
         # Newest first
         assert briefs[0]["content"] == "brief 4"
+
+
+class TestMarketDataRoutes:
+    """
+    HTTP surface over backend.tools.market_data. Tests mock execute_market_data
+    so we never hit yfinance in CI — that layer has its own tests, here we
+    only verify the HTTP wrapper (status codes, error mapping, param forwarding).
+    """
+
+    def test_quote_returns_data(self, client):
+        from unittest.mock import patch
+        fake = {
+            "ticker": "NVDA",
+            "name": "NVIDIA Corp",
+            "price": 201.68,
+            "change": 1.80,
+            "change_percent": 0.90,
+            "volume": 45_000_000,
+            "market_cap": 5_000_000_000_000,
+            "timestamp": "2026-04-18T12:00:00+00:00",
+        }
+        with patch("backend.tools.market_data.execute_market_data", return_value=fake):
+            resp = client.get("/market-data/NVDA/quote")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ticker"] == "NVDA"
+        assert body["price"] == 201.68
+
+    def test_quote_not_found_returns_404(self, client):
+        from unittest.mock import patch
+        with patch(
+            "backend.tools.market_data.execute_market_data",
+            return_value={"error": "No data found for ticker 'XYZZY'."},
+        ):
+            resp = client.get("/market-data/XYZZY/quote")
+        assert resp.status_code == 404
+
+    def test_quote_yfinance_failure_returns_502(self, client):
+        from unittest.mock import patch
+        with patch(
+            "backend.tools.market_data.execute_market_data",
+            return_value={"error": "Connection refused"},
+        ):
+            resp = client.get("/market-data/NVDA/quote")
+        assert resp.status_code == 502
+
+    def test_history_returns_prices_array(self, client):
+        from unittest.mock import patch
+        fake = {
+            "ticker": "NVDA",
+            "days_requested": 30,
+            "days_returned": 22,
+            "prices": [
+                {"date": "2026-04-01", "close": 190.00, "volume": 40_000_000},
+                {"date": "2026-04-02", "close": 192.50, "volume": 42_000_000},
+            ],
+            "timestamp": "2026-04-18T12:00:00+00:00",
+        }
+        with patch("backend.tools.market_data.execute_market_data", return_value=fake):
+            resp = client.get("/market-data/NVDA/history?days=30")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["days_requested"] == 30
+        assert len(body["prices"]) == 2
+
+    def test_history_forwards_days_param(self, client):
+        from unittest.mock import patch, MagicMock
+        mock = MagicMock(return_value={
+            "ticker": "SPY",
+            "days_requested": 90,
+            "days_returned": 65,
+            "prices": [],
+            "timestamp": "2026-04-18T12:00:00+00:00",
+        })
+        with patch("backend.tools.market_data.execute_market_data", mock):
+            client.get("/market-data/SPY/history?days=90")
+        mock.assert_called_once_with("price_history", ticker="SPY", days=90)
+
+    def test_history_rejects_bad_days(self, client):
+        """FastAPI Query validator should reject out-of-range days."""
+        resp = client.get("/market-data/NVDA/history?days=0")
+        assert resp.status_code == 422
+        resp = client.get("/market-data/NVDA/history?days=500")
+        assert resp.status_code == 422
+
+    def test_history_not_found_returns_404(self, client):
+        from unittest.mock import patch
+        with patch(
+            "backend.tools.market_data.execute_market_data",
+            return_value={"error": "No price history available for 'XYZZY'."},
+        ):
+            resp = client.get("/market-data/XYZZY/history")
+        assert resp.status_code == 404
