@@ -613,6 +613,37 @@ def count_journal_entries_needing_action(db: Session) -> int:
 # -- Price alerts --------------------------------------------------------------
 
 def create_price_alert(db: Session, **kwargs) -> PriceAlert:
+    """
+    Create a price alert, but silently dedupe active duplicates.
+
+    If an active alert already exists for the same (ticker, condition,
+    target_price), return it instead of creating a new row. Prevents the
+    "accidental double-click created three emails when the level hit"
+    failure mode without forcing the user through a confirmation dialog
+    or an error response they'd have to handle in the UI.
+
+    The dedupe is strict equality — if the user genuinely wants two
+    alerts at $500 and $500.01 they still get two rows. Only byte-for-
+    byte duplicates collapse.
+    """
+    ticker = kwargs.get("ticker", "").upper()
+    condition = kwargs.get("condition")
+    target_price = kwargs.get("target_price")
+
+    if ticker and condition and target_price is not None:
+        existing = (
+            db.query(PriceAlert)
+            .filter(
+                PriceAlert.ticker == ticker,
+                PriceAlert.condition == condition,
+                PriceAlert.target_price == target_price,
+                PriceAlert.active == True,  # noqa: E712
+            )
+            .first()
+        )
+        if existing is not None:
+            return existing
+
     alert = PriceAlert(**kwargs)
     db.add(alert)
     db.commit()
@@ -654,17 +685,37 @@ def mark_alert_triggered(
     db: Session,
     alert_id: str,
     triggered_price: float,
-) -> Optional[PriceAlert]:
-    """Mark an alert as fired: set triggered_at / triggered_price, deactivate."""
-    alert = db.query(PriceAlert).filter(PriceAlert.id == alert_id).first()
-    if alert is None:
-        return None
-    alert.triggered_at = datetime.now(timezone.utc)
-    alert.triggered_price = triggered_price
-    alert.active = False
+) -> bool:
+    """
+    Atomically mark an active alert as fired. Returns True if THIS call
+    won the race and the row was updated, False if the alert was already
+    triggered (or doesn't exist).
+
+    Uses a conditional UPDATE WHERE active=True so that when two workers
+    call this for the same alert concurrently, exactly one sees
+    rowcount=1 and the other sees rowcount=0. The caller uses the return
+    value to decide whether to fire the downstream notification (create
+    a news_reactions row, send the email). Without this atomicity, a
+    single alert could produce multiple emails under concurrent polls
+    — the bug this function was rewritten to fix.
+    """
+    rowcount = (
+        db.query(PriceAlert)
+        .filter(
+            PriceAlert.id == alert_id,
+            PriceAlert.active == True,  # noqa: E712
+        )
+        .update(
+            {
+                "triggered_at": datetime.now(timezone.utc),
+                "triggered_price": triggered_price,
+                "active": False,
+            },
+            synchronize_session=False,
+        )
+    )
     db.commit()
-    db.refresh(alert)
-    return alert
+    return rowcount == 1
 
 
 def delete_price_alert(db: Session, alert_id: str) -> bool:
