@@ -905,6 +905,8 @@ def _serialise_executed_order(o) -> dict:
         "limit_price": o.limit_price,
         "stop_loss_price": o.stop_loss_price,
         "take_profit_price": o.take_profit_price,
+        "target_qty": o.target_qty,
+        "bracket_state": o.bracket_state,
         "fill_price": o.fill_price,
         "status": o.status,
         "rejection_reason": o.rejection_reason,

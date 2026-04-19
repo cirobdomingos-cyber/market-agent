@@ -26,6 +26,11 @@ export default function ConfirmTradeModal({
   // Disagreement is optional. Both feed into the journal entry on success.
   const [userThesis, setUserThesis] = useState('')
   const [userDisagreement, setUserDisagreement] = useState('')
+  // Scale-out toggle. Default from the advisor's proposal (if it set
+  // target_qty) or off. Only meaningful for integer qty >= 2.
+  const [scaleOut, setScaleOut] = useState(
+    typeof proposal.target_qty === 'number' && proposal.target_qty < proposal.qty,
+  )
 
   const thesisValid = userThesis.trim().length >= 10
 
@@ -39,6 +44,27 @@ export default function ConfirmTradeModal({
     typeof proposal.target_1 === 'number' &&
     proposal.stop_loss < proposal.limit_price &&
     proposal.limit_price < proposal.target_1
+
+  // Scale-out eligibility: integer qty >= 2 so splitting is possible
+  // (exchanges can't sell a fractional share at T1 and a fractional share
+  // later). Also requires a valid bracket — no point in scale-out without
+  // an automatic T1.
+  const canScaleOut =
+    isBracket &&
+    Number.isInteger(proposal.qty) &&
+    proposal.qty >= 2
+
+  // When scale-out is on, T1 sells half (rounded down). Runner is the
+  // remainder. Advisor proposals can override by setting target_qty
+  // explicitly; otherwise half is the sensible default.
+  const scaleOutTargetQty =
+    scaleOut && canScaleOut
+      ? (typeof proposal.target_qty === 'number' && proposal.target_qty > 0 && proposal.target_qty < proposal.qty
+          ? proposal.target_qty
+          : Math.floor(proposal.qty / 2))
+      : null
+  const scaleOutRunnerQty =
+    scaleOutTargetQty !== null ? proposal.qty - scaleOutTargetQty : null
 
   const submit = async () => {
     setSubmitting(true)
@@ -55,6 +81,7 @@ export default function ConfirmTradeModal({
         // gate and 422 the request.
         stop_loss: isBracket ? proposal.stop_loss : null,
         target_1: isBracket ? proposal.target_1 : null,
+        target_qty: scaleOutTargetQty,
         rationale: proposal.rationale || null,
         advisor_session_id: advisorSessionId || null,
         confirm_live_capital: isLive ? confirmLive : false,
@@ -164,6 +191,41 @@ export default function ConfirmTradeModal({
               The broker binds these as an OCO group: when one exit fills the
               other cancels automatically. GTC — persists overnight.
             </p>
+
+            {canScaleOut && (
+              <div className="mt-3 pt-3 border-t border-indigo-800/60">
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={scaleOut}
+                    onChange={(e) => setScaleOut(e.target.checked)}
+                    className="mt-0.5 accent-indigo-500"
+                    disabled={submitting}
+                  />
+                  <span className="flex-1 text-gray-300">
+                    <span className="font-semibold text-indigo-200">
+                      Scale out at T1 — sell half, move stop to breakeven
+                    </span>
+                    {scaleOut && scaleOutTargetQty !== null && (
+                      <span className="block text-[11px] text-gray-400 font-mono mt-1">
+                        T1 sells {scaleOutTargetQty}, runner holds{' '}
+                        {scaleOutRunnerQty} with stop auto-moved to{' '}
+                        <span className="text-white">
+                          {fmtMoney(proposal.limit_price)}
+                        </span>{' '}
+                        after T1 fills.
+                      </span>
+                    )}
+                    {!scaleOut && (
+                      <span className="block text-[11px] text-gray-500 mt-1">
+                        Classic all-out: T1 sells the whole {proposal.qty}
+                        -share position. No runner, no breakeven move.
+                      </span>
+                    )}
+                  </span>
+                </label>
+              </div>
+            )}
           </div>
         ) : (
           (proposal.stop_loss || proposal.target_1 || proposal.target_2) && (
