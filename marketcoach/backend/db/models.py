@@ -454,3 +454,33 @@ class BacktestRun(Base):
     started_at = Column(DateTime, nullable=False)
     completed_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=_now_utc)
+
+
+class AdvisorActionCache(Base):
+    """
+    Per-ticker cache of the last advisor analysis. Short-circuits redundant
+    advisor calls when nothing material has changed since the prior run —
+    if we analyzed NVDA 2h ago at $450 with recommendation=HOLD and the
+    price is now $453 (under the material-change threshold), re-running
+    the advisor almost certainly yields the same conclusion.
+
+    Material-change rule (gate in orchestrator):
+      - Price moved ≥ 3% since last_price → re-run
+      - More than 48h since last_run_at → re-run
+      - Otherwise → skip, write a lightweight news_reactions row referencing
+        this cache entry so the UI still shows what was suppressed
+
+    Swing-trading tuning: with 2–20 day holds, fresh analysis every 48h
+    is plenty. Day-trader thresholds would be tighter.
+    """
+
+    __tablename__ = "advisor_action_cache"
+
+    ticker = Column(String, primary_key=True)
+    last_run_at = Column(DateTime, nullable=False, default=_now_utc)
+    last_price = Column(Float, nullable=False)
+    last_recommendation = Column(String, nullable=True)  # buy | hold | sell | avoid | unknown
+    last_rationale_summary = Column(Text, nullable=True)
+    last_advisor_session_id = Column(String, nullable=True)
+    updated_at = Column(DateTime, default=_now_utc, onupdate=_now_utc)
+
