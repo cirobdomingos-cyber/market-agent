@@ -39,6 +39,7 @@ function colorForPnl(v) {
 
 export default function Performance() {
   const [data, setData] = useState(null)
+  const [agentStats, setAgentStats] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
@@ -46,12 +47,22 @@ export default function Performance() {
     let cancelled = false
     const fetchData = async () => {
       try {
-        const res = await axios.get(`${API}/performance`)
-        if (!cancelled) {
-          setData(res.data)
+        // Two reads in parallel — performance KPIs and agent telemetry
+        // are independent. If telemetry fails (e.g. fresh DB with no
+        // agent_calls rows yet), the page still loads with a "—" card.
+        const [perf, agents] = await Promise.allSettled([
+          axios.get(`${API}/performance`),
+          axios.get(`${API}/agent-stats?days=7`),
+        ])
+        if (cancelled) return
+        if (perf.status === 'fulfilled') {
+          setData(perf.value.data)
           setError(null)
-          setLoading(false)
+        } else {
+          setError(perf.reason?.response?.data?.detail || 'Failed to load performance data')
         }
+        setAgentStats(agents.status === 'fulfilled' ? agents.value.data : null)
+        setLoading(false)
       } catch (err) {
         if (!cancelled) {
           setError(err.response?.data?.detail || 'Failed to load performance data')
@@ -96,7 +107,109 @@ export default function Performance() {
         spyBenchmark={data.spy_benchmark}
       />
       <AdvisorAttributionCard data={data} />
+      <AgentCostsCard stats={agentStats} />
       <RecentTradesTable trades={data.recent_trades} />
+    </div>
+  )
+}
+
+function AgentCostsCard({ stats }) {
+  // Hide the section entirely on a brand-new install with no agent_calls
+  // rows yet — better than showing a row of "—" placeholders that look
+  // broken.
+  if (!stats || stats.totals.calls === 0) return null
+
+  const { totals, by_agent, window_days } = stats
+
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-3">
+        <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
+          Agent costs (last {window_days}d)
+        </h2>
+        <span className="text-xs text-gray-500">
+          List-price USD — comparative spend, not your literal Anthropic bill
+        </span>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+        <KpiCard
+          label="Total cost"
+          value={`$${totals.cost_usd.toFixed(2)}`}
+          subtitle={`${totals.calls} calls`}
+        />
+        <KpiCard
+          label="Output tokens"
+          value={(totals.output_tokens / 1000).toFixed(1) + 'k'}
+          subtitle={`${(totals.input_tokens / 1000).toFixed(0)}k input`}
+        />
+        <KpiCard
+          label="Cache hit rate"
+          value={
+            totals.cache_hit_rate_pct === null
+              ? '—'
+              : `${totals.cache_hit_rate_pct.toFixed(1)}%`
+          }
+          subtitle={`${(totals.cache_read_tokens / 1000).toFixed(0)}k cached reads`}
+          valueClassName={
+            totals.cache_hit_rate_pct === null
+              ? 'text-gray-400'
+              : totals.cache_hit_rate_pct >= 50
+                ? 'text-emerald-400'
+                : totals.cache_hit_rate_pct >= 20
+                  ? 'text-amber-400'
+                  : 'text-rose-400'
+          }
+        />
+        <KpiCard
+          label="Avg latency"
+          value={
+            totals.avg_latency_ms === null
+              ? '—'
+              : `${(totals.avg_latency_ms / 1000).toFixed(1)}s`
+          }
+          subtitle="per Anthropic call"
+        />
+      </div>
+
+      <div className="border border-gray-800 rounded-lg overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-900 text-gray-400 text-xs uppercase tracking-wide">
+            <tr>
+              <th className="text-left px-4 py-2">Agent</th>
+              <th className="text-left px-4 py-2">Model</th>
+              <th className="text-right px-4 py-2">Calls</th>
+              <th className="text-right px-4 py-2">Cost</th>
+              <th className="text-right px-4 py-2">Cache hit</th>
+              <th className="text-right px-4 py-2">Avg latency</th>
+            </tr>
+          </thead>
+          <tbody>
+            {by_agent.map((b) => (
+              <tr key={b.agent} className="border-t border-gray-800">
+                <td className="px-4 py-2 font-mono">{b.agent}</td>
+                <td className="px-4 py-2 text-xs text-gray-400 font-mono">
+                  {b.model.replace('claude-', '').replace('-20251001', '')}
+                </td>
+                <td className="px-4 py-2 text-right font-mono">{b.calls}</td>
+                <td className="px-4 py-2 text-right font-mono">
+                  ${b.cost_usd.toFixed(2)}
+                </td>
+                <td className="px-4 py-2 text-right font-mono text-gray-400">
+                  {b.cache_hit_rate_pct === null
+                    ? '—'
+                    : `${b.cache_hit_rate_pct.toFixed(0)}%`}
+                </td>
+                <td className="px-4 py-2 text-right font-mono text-gray-400">
+                  {b.avg_latency_ms === null
+                    ? '—'
+                    : `${(b.avg_latency_ms / 1000).toFixed(1)}s`}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }

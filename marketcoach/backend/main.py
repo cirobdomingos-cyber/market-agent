@@ -642,6 +642,111 @@ def _build_spy_benchmark(closed: list) -> list[dict]:
     return points
 
 
+@app.get("/agent-stats")
+def get_agent_stats(
+    days: int = Query(7, ge=1, le=90),
+    db: Session = Depends(get_db),
+):
+    """
+    Observability rollup for agent_calls — what every agent has cost
+    over the last `days` window, how often it ran, how the prompt cache
+    is performing.
+
+    Three slices in one payload (one HTTP round trip per dashboard load):
+      - totals: window-wide cost, call count, token sums, cache-hit rate
+      - by_agent: same cuts grouped by agent class name, sorted by cost
+      - daily: per-day cost time series for the chart
+
+    The cost figure is list-price USD computed at write-time (see
+    backend/agents/pricing.py). On a Pro/Max plan there is no per-call
+    invoice — list price is the comparative signal we care about, not
+    the literal Anthropic bill.
+    """
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import func
+
+    from backend.db.models import AgentCall
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    rows = (
+        db.query(AgentCall)
+        .filter(AgentCall.run_at >= cutoff)
+        .all()
+    )
+
+    def _summarise(items: list) -> dict:
+        if not items:
+            return {
+                "calls": 0,
+                "cost_usd": 0.0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_hit_rate_pct": None,
+                "avg_latency_ms": None,
+            }
+        cache_read = sum(r.cache_read_tokens for r in items)
+        cache_create = sum(r.cache_creation_tokens for r in items)
+        input_tok = sum(r.input_tokens for r in items)
+        cache_eligible = cache_read + cache_create + input_tok
+        latencies = [r.latency_ms for r in items if r.latency_ms is not None]
+        return {
+            "calls": len(items),
+            "cost_usd": round(sum(r.cost_usd for r in items), 4),
+            "input_tokens": input_tok,
+            "output_tokens": sum(r.output_tokens for r in items),
+            "cache_read_tokens": cache_read,
+            "cache_creation_tokens": cache_create,
+            # Hit rate = cached input / all input that COULD have been cached.
+            # None when the agent never primed a cache window in the period
+            # (denominator zero) — the frontend renders "—" rather than 0%.
+            "cache_hit_rate_pct": (
+                round(100.0 * cache_read / cache_eligible, 1)
+                if cache_eligible > 0 else None
+            ),
+            "avg_latency_ms": (
+                round(sum(latencies) / len(latencies))
+                if latencies else None
+            ),
+        }
+
+    by_agent_buckets: dict = {}
+    for r in rows:
+        by_agent_buckets.setdefault(r.agent, []).append(r)
+
+    by_agent = [
+        {"agent": agent, **_summarise(items), "model": items[0].model}
+        for agent, items in by_agent_buckets.items()
+    ]
+    by_agent.sort(key=lambda b: b["cost_usd"], reverse=True)
+
+    # Daily series — group by date (UTC) for the line chart.
+    daily_buckets: dict = {}
+    for r in rows:
+        if r.run_at is None:
+            continue
+        key = r.run_at.date().isoformat()
+        daily_buckets.setdefault(key, []).append(r)
+
+    daily = [
+        {
+            "date": d,
+            "cost_usd": round(sum(x.cost_usd for x in items), 4),
+            "calls": len(items),
+        }
+        for d, items in sorted(daily_buckets.items())
+    ]
+
+    return {
+        "window_days": days,
+        "totals": _summarise(rows),
+        "by_agent": by_agent,
+        "daily": daily,
+    }
+
+
 @app.post("/pipeline/run", response_model=PipelineRunResponse)
 def run_pipeline(
     db: Session = Depends(get_db),

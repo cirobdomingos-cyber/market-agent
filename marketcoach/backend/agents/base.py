@@ -166,6 +166,7 @@ class BaseAgent(ABC):
         """
         for attempt in range(max_retries):
             try:
+                started = time.monotonic()
                 response = self.client.messages.create(
                     model=self.MODEL,
                     max_tokens=4096,
@@ -173,7 +174,9 @@ class BaseAgent(ABC):
                     messages=messages,
                     tools=tools if tools else anthropic.NOT_GIVEN,
                 )
+                latency_ms = int((time.monotonic() - started) * 1000)
                 self._log_cache_usage(response)
+                self._record_call(response, latency_ms)
                 return response
             except anthropic.RateLimitError:
                 wait = 30 * (2 ** attempt)  # 30s, 60s, 120s
@@ -185,6 +188,70 @@ class BaseAgent(ABC):
                     time.sleep(wait)
                 else:
                     raise
+
+    def _record_call(
+        self,
+        response: anthropic.types.Message,
+        latency_ms: int,
+    ) -> None:
+        """
+        Persist one row in agent_calls for the observability dashboard.
+
+        Uses a fresh short-lived SQLAlchemy session — NOT self.db — so a
+        telemetry insert never gets entangled with whatever transaction
+        the calling agent has open. If the insert fails (e.g. the test
+        DB doesn't have the table, or the connection is down), we log
+        and swallow: telemetry must never break the agent path.
+
+        Token counters are integers in the SDK's response.usage; we
+        coerce defensively because mocked test responses sometimes hand
+        us MagicMocks instead.
+        """
+        try:
+            from backend.agents.pricing import cost_usd
+            from backend.db import SessionLocal
+            from backend.db.models import AgentCall
+
+            usage = getattr(response, "usage", None)
+            if usage is None:
+                return
+
+            def _coerce(value) -> int:
+                try:
+                    return int(value or 0)
+                except (TypeError, ValueError):
+                    return 0
+
+            input_tokens = _coerce(getattr(usage, "input_tokens", 0))
+            output_tokens = _coerce(getattr(usage, "output_tokens", 0))
+            cache_read = _coerce(getattr(usage, "cache_read_input_tokens", 0))
+            cache_create = _coerce(getattr(usage, "cache_creation_input_tokens", 0))
+
+            cost = cost_usd(
+                model=self.MODEL,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+                cache_creation_tokens=cache_create,
+            )
+
+            session = SessionLocal()
+            try:
+                session.add(AgentCall(
+                    agent=type(self).__name__,
+                    model=self.MODEL,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read,
+                    cache_creation_tokens=cache_create,
+                    cost_usd=cost,
+                    latency_ms=latency_ms,
+                ))
+                session.commit()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.debug("Agent telemetry write failed (non-fatal): %s", exc)
 
     @staticmethod
     def _log_cache_usage(response: anthropic.types.Message) -> None:

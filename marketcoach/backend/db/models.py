@@ -469,6 +469,42 @@ class BacktestRun(Base):
     created_at = Column(DateTime, default=_now_utc)
 
 
+class AgentCall(Base):
+    """
+    One row per Anthropic API call made by any agent. Powers the
+    observability dashboard ("how much is this thing costing me, and
+    where is the money going?").
+
+    Captured in BaseAgent._call_api after a successful response. We write
+    on a separate short-lived session so a telemetry insert never
+    interferes with whatever transaction the calling agent has open.
+
+    Cost is computed at write-time from the model + usage counts using a
+    static pricing table. Storing the dollar figure (rather than only the
+    raw token counts) means historical rollups stay correct even if
+    Anthropic changes their list price later — yesterday's calls keep
+    yesterday's pricing.
+
+    Failed calls are NOT recorded here; if the API errors, no usage was
+    billed. Cache hit rate is derivable from cache_read_tokens / (input_
+    tokens + cache_read_tokens + cache_creation_tokens) — store the raw
+    counts so the frontend can recompute whatever ratio it wants.
+    """
+
+    __tablename__ = "agent_calls"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    agent = Column(String, nullable=False, index=True)   # class name, e.g. "TradingAdvisorAgent"
+    model = Column(String, nullable=False)                 # e.g. "claude-sonnet-4-6"
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+    cache_read_tokens = Column(Integer, nullable=False, default=0)
+    cache_creation_tokens = Column(Integer, nullable=False, default=0)
+    cost_usd = Column(Float, nullable=False, default=0.0)
+    latency_ms = Column(Integer, nullable=True)
+    run_at = Column(DateTime, default=_now_utc, index=True)
+
+
 class AdvisorActionCache(Base):
     """
     Per-ticker cache of the last advisor analysis. Short-circuits redundant
