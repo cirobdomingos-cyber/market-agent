@@ -26,3 +26,5 @@ dist/
 .idea/
 *.swp
 *.swo
+
+.claude/scheduled_tasks.lock
